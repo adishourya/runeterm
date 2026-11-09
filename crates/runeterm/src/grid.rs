@@ -755,6 +755,22 @@ impl GridRenderer {
         row
     }
 
+    /// For `runeterm --bench`: builds every row of `frame` the way a frame does (glyph lookup,
+    /// rasterizing what's new, instances), and returns how many instances that made.
+    pub fn bench_rows(&mut self, frame: &Frame, scale: f32) -> usize {
+        let m = self.metrics_at(scale);
+        let pad = (self.spec.padding * scale).round();
+        let mut n = 0;
+        for (y, r) in frame.dirty_rows.iter().enumerate() {
+            if let Some(cells) = r {
+                let row = self.build_row(m, pad, y, cells, frame.bg);
+                n += row.bg.len() + row.fg.len();
+            }
+        }
+        self.atlas.uploads.clear();
+        n
+    }
+
     fn metrics_at(&mut self, scale: f32) -> Metrics {
         match self.metrics {
             Some(m) if (m.px - (self.spec.size * 96.0 / 72.0 * scale).round()).abs() < 0.5 => m,

@@ -1,3 +1,4 @@
+mod bench;
 mod config;
 mod grid;
 mod icons;
@@ -36,6 +37,10 @@ fn main() {
     log_panics();
     vt::install_png_decoder();
     let config = config::Config::load();
+    if std::env::args().any(|a| a == "--bench") {
+        bench::run(&config);
+        return;
+    }
     eprintln!("runeterm: libghostty-vt {}, font {} {}pt", vt::version(), config.font.family, config.font.size);
     // Wayland app_id / X11 WM_CLASS: matches runeterm.desktop, and compositor window rules.
     rune::set_app_id("runeterm");

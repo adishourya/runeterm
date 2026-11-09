@@ -28,6 +28,26 @@ libclang.
 Sessions need a `spooky` that accepts several controllers (the `spooky-multi-controller`
 branch); without a daemon, runeterm runs plain local shells (`RUNETERM_LOCAL=1` forces that).
 
+## Performance
+
+`runeterm --bench` measures the hot paths in a few seconds, without a window. On a laptop
+(release build, libghostty-vt 1.0.0):
+
+| | |
+|---|---|
+| Parsing plain lines | 252 MB/s |
+| Parsing coloured `ls`-style lines | 159 MB/s |
+| Parsing full-screen redraws (htop-like) | 412 MB/s |
+| Building a full 200×60 frame (6,400 quads) | 0.77 ms |
+| Building a frame with one changed line | 0.014 ms |
+| `seq 1 2000000` through a bare pty to /dev/null | 26.9 MB/s |
+| … into runeterm on a local pty | 28.3 MB/s |
+| … into runeterm through spooky | 26.8 MB/s |
+
+Parsing runs 6–15× faster than a pty delivers, a full redraw uses under a tenth of a 120 Hz
+frame (GPU time not included), and end to end runeterm keeps up with the pty itself, through
+spooky too.
+
 ## Use
 
 - `runeterm` opens a new session; `runeterm attach NAME` opens an existing one.
