@@ -17,6 +17,27 @@ use swash::FontRef;
 
 const ATLAS: u32 = 2048;
 
+/// Where a pane's grid is, for turning pointer positions into cells: device pixels per point,
+/// the padding and cell size in device pixels, and the grid's size.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Geometry {
+    pub scale: f32,
+    pub pad: f32,
+    pub cell_w: f32,
+    pub cell_h: f32,
+    pub cols: u16,
+    pub rows: u16,
+    pub width: f32,
+    pub height: f32,
+}
+
+static GEOMETRY: std::sync::Mutex<Option<HashMap<u32, Geometry>>> = std::sync::Mutex::new(None);
+
+/// A pane's grid geometry, as last drawn.
+pub fn geometry(pane: u32) -> Option<Geometry> {
+    GEOMETRY.lock().unwrap().as_ref()?.get(&pane).copied()
+}
+
 /// Font settings, in Rune points.
 #[derive(Clone)]
 pub struct FontSpec {
@@ -600,6 +621,8 @@ pub struct GridRenderer {
     /// Image textures by (pane, image id).
     textures: HashMap<(u32, u32), ImageTex>,
     theme: crate::pane::Theme,
+    /// Selections are tinted with it.
+    accent: Rgb,
     cursor_opacity: f32,
     cursor_smooth: bool,
     shaders: Vec<String>,
@@ -629,7 +652,8 @@ impl GridRenderer {
             gpu: None,
             panes: HashMap::new(),
             textures: HashMap::new(),
-            theme: crate::pane::Theme { ansi: config.theme.ansi, ..config.theme },
+            theme: config.colors(),
+            accent: config.accent,
             cursor_opacity: config.cursor_opacity,
             cursor_smooth: config.cursor_smooth,
             shaders,
@@ -648,7 +672,8 @@ impl GridRenderer {
         self.fonts = Fonts::load(&config.font.family);
         self.metrics = None;
         self.atlas = Atlas::new();
-        self.theme = crate::pane::Theme { ansi: config.theme.ansi, ..config.theme };
+        self.theme = config.colors();
+        self.accent = config.accent;
         self.cursor_opacity = config.cursor_opacity;
         self.cursor_smooth = config.cursor_smooth;
         self.shaders = config.shaders.iter().filter_map(|p| shader::load(p)).collect();
@@ -677,7 +702,10 @@ impl GridRenderer {
     fn build_row(&mut self, m: Metrics, pad: f32, y: usize, cells: &[Cell], frame_fg: Rgb) -> Row {
         let mut row = Row::default();
         let top = pad + y as f32 * m.h;
-        let sel_bg = Rgb(0x3b, 0x4a, 0x63);
+        // The accent, mixed into the background.
+        let mix = |a: u8, b: u8| ((a as f32) * 0.38 + (b as f32) * 0.62).round() as u8;
+        let (ac, bg) = (self.accent, self.theme.bg);
+        let sel_bg = Rgb(mix(ac.0, bg.0), mix(ac.1, bg.1), mix(ac.2, bg.2));
         for (x, c) in cells.iter().enumerate() {
             let left = pad + x as f32 * m.w;
             let bg = if c.selected { Some(sel_bg) } else { c.bg };
@@ -690,7 +718,8 @@ impl GridRenderer {
                     _ => row.bg.push(Inst { pos: [left, top], size: [m.w, m.h], color: rgba(bg, 1.0), ..Default::default() }),
                 }
             }
-            let fg = if c.selected { frame_fg } else { c.fg };
+            let _ = frame_fg;
+            let fg = c.fg; // selected text keeps its colour on the tinted background
             if let Some(ch) = c.text.chars().next().filter(|ch| !ch.is_whitespace()) {
                 let style = c.bold as u8 | (c.italic as u8) << 1;
                 if let Some(s) = self.atlas.get(&mut self.ctx, &mut self.fonts, &m, ch, style).filter(|s| s.color) {
@@ -774,6 +803,10 @@ impl GridRenderer {
             _ => p.pending_grid = Some((want, self.time)),
         }
 
+        if let Some((cols, rows)) = p.grid {
+            let g = Geometry { scale: site.scale, pad, cell_w: m.w, cell_h: m.h, cols, rows, width: rect[2], height: rect[3] };
+            GEOMETRY.lock().unwrap().get_or_insert_with(HashMap::new).insert(id, g);
+        }
         let textures = &self.textures;
         let frame: Frame = {
             let t = pane.term.lock().unwrap();

@@ -10,23 +10,65 @@ use crate::state::{PickerMode, State, Tab, WAKER};
 use rune::color::hex;
 use rune::tok::motion;
 use rune::{
+    PointerButton, Spring,
     AppSpec, Color, Cursor, Cx, Cycle, Drag, El, Icon, Phase, TextStyle, Transition, Tx, col, effect, el, icon, row, text,
 };
 
 /// Colours and sizes: dark, quiet chrome around the terminals.
 pub mod look {
     use super::*;
+    use std::cell::Cell;
 
-    pub fn window() -> Color { hex("#070708").unwrap() }
-    pub fn text() -> Color { hex("#eef0f3").unwrap() }
-    pub fn dim() -> Color { hex("#8b919b").unwrap() }
-    pub fn faint() -> Color { hex("#565c66").unwrap() }
-    pub fn busy() -> Color { hex("#3ccf6c").unwrap() }
-    pub fn attention() -> Color { hex("#ff9a3c").unwrap() }
-    pub fn hairline() -> Color { Color::WHITE.alpha(0.05) }
+    thread_local! {
+        static LIGHT: Cell<bool> = const { Cell::new(false) };
+        static ACCENT: Cell<Color> = const { Cell::new(Color { r: 0.54, g: 0.71, b: 0.97, a: 1.0 }) };
+    }
+
+    /// Set at the start of every view: light or dark, and the accent.
+    pub fn set(light: bool, accent: Color) {
+        LIGHT.with(|l| l.set(light));
+        ACCENT.with(|a| a.set(accent));
+    }
+
+    pub fn light() -> bool {
+        LIGHT.with(|l| l.get())
+    }
+
+    fn pick(dark: &str, light_: &str) -> Color {
+        hex(if light() { light_ } else { dark }).unwrap()
+    }
+
+    pub fn accent() -> Color { ACCENT.with(|a| a.get()) }
+    pub fn window() -> Color { pick("#070708", "#e8e8eb") }
+    pub fn text() -> Color { pick("#eef0f3", "#1c1f24") }
+    pub fn dim() -> Color { pick("#8b919b", "#5b616b") }
+    pub fn faint() -> Color { pick("#565c66", "#959ba5") }
+    pub fn busy() -> Color { pick("#3ccf6c", "#1f9d4c") }
+    pub fn attention() -> Color { pick("#ff9a3c", "#e07a12") }
+    /// Overlays and hairlines: white on dark, black on light.
+    pub fn ink(a: f32) -> Color {
+        if light() { Color::BLACK.alpha(a * 0.9) } else { Color::WHITE.alpha(a) }
+    }
+    /// Shadows, softer on light.
+    pub fn shade(a: f32) -> Color {
+        Color::BLACK.alpha(if light() { a * 0.32 } else { a })
+    }
+    pub fn hairline() -> Color { ink(0.05) }
+    /// Raised surfaces: 0 the open sidebar, 1 cards, 2 popovers, 3 tiles and pills.
+    pub fn surface(level: u8) -> Color {
+        match level {
+            0 => pick("#0b0b0d", "#f3f3f5"),
+            1 => pick("#121317", "#ffffff"),
+            2 => pick("#131417", "#fbfbfc"),
+            _ => pick("#16171a", "#ffffff"),
+        }
+    }
     pub const RADIUS: f32 = 14.0;
     pub const GAP: f32 = 8.0;
 }
+
+/// Splits resize on this: quick, so text never sits scaled for long.
+const FAST: Spring = Spring::new(0.1, 0.0);
 
 const TITLE: TextStyle = TextStyle::new(13.0, 600.0);
 const BODY: TextStyle = TextStyle::new(12.5, 420.0);
@@ -57,7 +99,7 @@ fn dot(c: Color, pulse: bool) -> El {
 
 fn tool(key: String, i: &'static Icon, help: &str, f: impl Fn(&mut State) + 'static) -> El {
     el().key(key).size(26.0, 26.0).radius(7.0).center()
-        .hover(Color::WHITE.alpha(0.08)).press(Color::WHITE.alpha(0.14))
+        .hover(look::ink(0.08)).press(look::ink(0.14))
         .cursor(Cursor::Pointer)
         .help(help.to_string())
         .on_press(f)
@@ -96,7 +138,7 @@ fn pane(s: &State, tab: &Tab, id: u32) -> El {
             .child(tool(format!("min-{id}"), &icons::MINIMIZE, "Minimize  ⌥M", move |s: &mut State| s.minimize(id)))
             .child(tool(format!("zoom-{id}"), if tab.zoomed { &icons::COLLAPSE } else { &icons::EXPAND }, "Zoom  ⌥↩", move |s: &mut State| s.toggle_zoom(id)));
     }
-    tools = tools.child(tool(format!("close-{id}"), &icons::CLOSE, "Close  ⌥X", move |s: &mut State| s.close(id)));
+    tools = tools.child(tool(format!("close-{id}"), &icons::CLOSE, "Close  ⌥X", move |s: &mut State| s.request_close(id)));
     let tools = if focused { tools } else { tools.group_opacity(0.0, 1.0) };
 
     let header = row().key(format!("head-{id}")).h(40.0).w_full().pl(12.0).pr(8.0).items_center()
@@ -104,29 +146,24 @@ fn pane(s: &State, tab: &Tab, id: u32) -> El {
         .child(title)
         .child(tools);
 
-    let tint = if attention { look::attention() } else { icons::program(program).1 };
+    let tint = if attention { look::attention() } else { look::accent() };
     let mut card = col().key(format!("pane-{id}")).matched(format!("pane-{id}"))
         .w_full().h_full().min_w(0.0).min_h(0.0)
         .radius(look::RADIUS).fill(pane_bg(s)).border(1.0, look::hairline())
         .clip_rounded(look::RADIUS)
         .hover_group()
         .transition(Transition::scale(0.96).combined(Transition::opacity()))
+        // Resizes land fast: text scaled mid-spring looks smeared.
+        .motion(FAST)
+        .cursor(Cursor::Default)
         .on_press(move |s: &mut State| s.focus(id))
-        .on_wheel(move |s: &mut State, w, _| {
-            if let Some(p) = s.panes.get(&id) {
-                let mut t = p.term.lock().unwrap();
-                if !t.mouse_tracking() {
-                    t.scroll((-w.dy / 20.0).round() as isize);
-                    p.dirty.store(true, std::sync::atomic::Ordering::Release);
-                }
-            }
-            true
-        });
+        // Taken here so a drag on the header doesn't move the dividers around it.
+        .on_drag(|_: &mut State, _: &mut Drag, _: &mut Tx| {});
     if focused || attention {
         // A soft light from the top of the card, tinted by the program, slowly breathing.
         card = card
-            .shadow(1.0, 3.0, Color::BLACK.alpha(0.45))
-            .shadow(14.0, 44.0, Color::BLACK.alpha(0.55))
+            .shadow(1.0, 3.0, look::shade(0.45))
+            .shadow(14.0, 44.0, look::shade(0.55))
             .child(
                 el().key(format!("glow-{id}")).absolute(0.0, 0.0).w_full().h(220.0)
                     .radial_gradient([0.5, 0.0], [620.0, 220.0], [(0.0, tint.alpha(if focused { 0.13 } else { 0.09 })), (1.0, tint.alpha(0.0))])
@@ -141,21 +178,74 @@ fn pane(s: &State, tab: &Tab, id: u32) -> El {
                     .transition(Transition::opacity()),
             );
     }
-    card.child(header).child(effect(id).key(format!("grid-{id}")).w_full().grow(1.0).min_h(0.0))
+    // The grid takes the mouse: selection, links, and mouse reports for programs that ask.
+    let grid = effect(id).key(format!("grid-{id}")).w_full().grow(1.0).min_h(0.0)
+        .cursor(Cursor::Text)
+        .pointer_buttons([PointerButton::Middle])
+        .on_drag(move |s: &mut State, d: &mut Drag, tx: &mut Tx| {
+            let (button, mods) = (tx.button(), tx.mods());
+            s.mouse(id, d.phase, d.x, d.y, button, mods, tx)
+        })
+        .on_pointer_move_local(move |s: &mut State, p, tx: &mut Tx| {
+            let mods = tx.mods();
+            s.mouse_moved(id, p.x, p.y, mods)
+        })
+        .on_wheel(move |s: &mut State, w, _| {
+            s.wheel(id, w.x, w.y, w.dy, w.mods);
+            true
+        });
+    card = card.child(header).child(grid);
+    if s.confirm_close == Some(id) {
+        card = card.child(row().pin(Some(0.0), None, Some(0.0), Some(18.0)).justify_center().child(confirm_close(s, id, program)));
+    }
+    card
 }
 
-fn node(s: &State, tab: &Tab, n: &Node) -> El {
+/// Asking before closing a split that's running something: Enter closes, Escape keeps it.
+fn confirm_close(_s: &State, id: u32, program: &str) -> El {
+    let red = hex("#ff6b6b").unwrap();
+    let button = |key: String, label: &str, fill: Color, color: Color| {
+        el().key(key).h(30.0).px(14.0).radius(9.0).center().fill(fill).hover(look::ink(0.08)).cursor(Cursor::Pointer)
+            .child(text(label.to_string()).font(TextStyle::new(12.5, 600.0)).color(color))
+    };
+    row().key(format!("confirm-close-{id}")).h(50.0).pl(16.0).pr(8.0).gap(10.0).items_center().radius(16.0)
+        .fill(look::surface(2).alpha(0.97)).backdrop_blur(18.0)
+        .border(1.0, red.alpha(0.35))
+        .shadow(4.0, 12.0, look::shade(0.4)).shadow(18.0, 48.0, look::shade(0.5))
+        .transition(Transition::offset(0.0, 10.0).combined(Transition::opacity()))
+        .on_press(|_: &mut State| {})
+        .child(icons::program_logo(program, 22.0))
+        .child(col().gap(1.0)
+            .child(text(format!("Close {program}?")).font(TITLE).color(look::text()))
+            .child(text("It's still running").font(SMALL).color(look::dim())))
+        .child(el().w(12.0))
+        .child(button(format!("keep-{id}"), "Cancel  esc", look::ink(0.07), look::text()).on_press(|s: &mut State| s.confirm_close = None))
+        .child(button(format!("do-close-{id}"), "Close  ↩", red.alpha(0.9), Color::WHITE).on_press(move |s: &mut State| {
+            s.confirm_close = None;
+            s.close(id);
+        }))
+}
+
+fn node(s: &State, tab: &Tab, n: &Node, path: Vec<bool>) -> El {
     match n {
         Node::Leaf(id) => pane(s, tab, *id),
         Node::Split { dir, ratio, a, b } => {
-            let wrap = |e: El, g: f32| el().grow(g).min_w(0.0).min_h(0.0).w_full().h_full().child(e);
-            let c = match dir {
-                Dir::Right => row(),
-                Dir::Down => col(),
-            };
-            c.w_full().h_full().gap(look::GAP).min_w(0.0).min_h(0.0)
-                .child(wrap(node(s, tab, a), *ratio))
-                .child(wrap(node(s, tab, b), 1.0 - ratio))
+            let wrap = |e: El, g: f32| el().grow(g).min_w(0.0).min_h(0.0).w_full().h_full().motion(FAST).child(e);
+            let across = *dir == Dir::Right;
+            let c = if across { row() } else { col() };
+            let (pa, pb) = ([path.clone(), vec![false]].concat(), [path.clone(), vec![true]].concat());
+            // The gap between the two is a handle: drag it to move the divider.
+            c.key(format!("split-{}", path.iter().map(|b| if *b { '1' } else { '0' }).collect::<String>()))
+                .w_full().h_full().gap(look::GAP).min_w(0.0).min_h(0.0).motion(FAST)
+                .cursor(if across { Cursor::ResizeColumn } else { Cursor::ResizeRow })
+                .on_drag(move |s: &mut State, d: &mut Drag, tx: &mut Tx| {
+                    let (pos, len) = if across { (d.x, d.w) } else { (d.y, d.h) };
+                    let r = (pos - look::GAP / 2.0) / (len - look::GAP).max(1.0);
+                    s.set_ratio(&path, r);
+                    tx.instant();
+                })
+                .child(wrap(node(s, tab, a, pa), *ratio))
+                .child(wrap(node(s, tab, b, pb), 1.0 - ratio))
         }
     }
 }
@@ -169,7 +259,7 @@ fn leaf(s: &State, tab: &Tab, id: u32, active_tab: bool) -> El {
     let minimized = tab.minimized.iter().any(|m| m.id == id);
     let focused = active_tab && tab.focused == id && !minimized;
     let mut r = row().key(format!("leaf-{id}")).w_full().h(30.0).px(6.0).gap(8.0).items_center().radius(8.0)
-        .hover(Color::WHITE.alpha(0.04)).cursor(Cursor::Pointer)
+        .hover(look::ink(0.04)).cursor(Cursor::Pointer)
         .transition(Transition::offset(0.0, -4.0).combined(Transition::opacity()))
         .on_press(move |s: &mut State| s.focus(id))
         .child(logo(&program, 18.0, attention))
@@ -181,7 +271,7 @@ fn leaf(s: &State, tab: &Tab, id: u32, active_tab: bool) -> El {
         )
         .child(text(cwd).font(SMALL).color(look::faint()).single_line().truncate().shrink().grow(1.0));
     if focused {
-        r = r.fill(Color::WHITE.alpha(0.06));
+        r = r.fill(look::ink(0.06));
     }
     if minimized {
         r = r.opacity(0.7).child(icon(&icons::MINIMIZE, 12.0).color(look::faint()));
@@ -208,7 +298,7 @@ fn tab_group(s: &State, i: usize, tab: &Tab) -> El {
         .on_press(move |s: &mut State| s.select_tab(i))
         .child(
             el().size(20.0, 20.0).radius(6.0).center()
-                .fill(if active { Color::WHITE.alpha(0.1) } else { Color::WHITE.alpha(0.05) })
+                .fill(if active { look::ink(0.1) } else { look::ink(0.05) })
                 .child(text(format!("{}", i + 1)).font(CAPS).color(if active { look::text() } else { look::dim() })),
         )
         .child(text(title).font(TITLE).color(if active { look::text() } else { look::dim() }).single_line().truncate().shrink().grow(1.0));
@@ -225,7 +315,7 @@ fn tab_group(s: &State, i: usize, tab: &Tab) -> El {
         leaves = leaves.child(leaf(s, tab, id, active));
     }
     let tree = row().w_full().pl(15.0).gap(7.0).items_stretch()
-        .child(el().w(1.0).fill(Color::WHITE.alpha(if active { 0.1 } else { 0.06 })).my(4.0))
+        .child(el().w(1.0).fill(look::ink(if active { 0.1 } else { 0.06 })).my(4.0))
         .child(leaves);
 
     let mut g = col().key(format!("group-{i}")).w_full().p_all(4.0).gap(2.0).radius(12.0)
@@ -233,9 +323,9 @@ fn tab_group(s: &State, i: usize, tab: &Tab) -> El {
         .child(head)
         .child(tree);
     if active {
-        g = g.fill(Color::WHITE.alpha(0.03)).border(1.0, Color::WHITE.alpha(0.04));
+        g = g.fill(look::ink(0.03)).border(1.0, look::ink(0.04));
     } else {
-        g = g.hover(Color::WHITE.alpha(0.02));
+        g = g.hover(look::ink(0.02));
     }
     g
 }
@@ -274,14 +364,15 @@ fn badge(s: &State, size: f32) -> El {
         _ => icon(&icons::TERMINAL, size * 0.46).color(c),
     };
     el().key("session-badge").size(size, size).radius(size * 0.32).center()
-        .fill(hex("#15161a").unwrap())
+        .fill(look::surface(3))
         .radial_gradient([0.5, 0.0], [size * 1.1, size * 1.1], [(0.0, c.alpha(0.42)), (0.65, c.alpha(0.12)), (1.0, c.alpha(0.04))])
         .border(1.0, c.alpha(0.45))
-        .shadow(2.0, 4.0, Color::BLACK.alpha(0.5))
+        .shadow(2.0, 4.0, look::shade(0.5))
         .shadow(6.0, 22.0, c.alpha(0.28))
-        .hover(Color::WHITE.alpha(0.06)).press(Color::WHITE.alpha(0.1)).cursor(Cursor::Pointer)
-        .help("Sessions")
+        .hover(look::ink(0.06)).press(look::ink(0.1)).cursor(Cursor::Pointer)
+        .help("Sessions · right-click for the emoji")
         .on_press(|s: &mut State| s.toggle_picker())
+        .on_secondary_press(|s: &mut State, _, _: &mut Tx| s.choose_own_emoji())
         .child(face)
 }
 
@@ -293,27 +384,30 @@ fn session_name(s: &State) -> String {
     }
 }
 
-/// A battery: an outline filled to its level (amber, then red, when low; green while
-/// charging), and the percentage.
+/// A battery: an outline filled to its level (amber, then red, when low; green on the
+/// charger, with a bolt while charging or a plug when it's full), and the percentage.
 fn battery(b: crate::status::Battery, scale: f32) -> El {
     let level = b.level as f32 / 100.0;
-    let color = if b.charging {
+    let color = if b.charging || b.plugged {
         look::busy()
     } else if b.level <= 10 {
         hex("#ff6b6b").unwrap()
     } else if b.level <= 20 {
         hex("#ffb454").unwrap()
     } else {
-        Color::WHITE.alpha(0.82)
+        look::ink(0.82)
     };
     let (w, h) = (22.0 * scale, 11.0 * scale);
-    let body = el().size(w, h).radius(3.0 * scale).border(1.2, Color::WHITE.alpha(0.42)).p_all(1.6 * scale)
+    let body = el().size(w, h).radius(3.0 * scale).border(1.2, look::ink(0.42)).p_all(1.6 * scale)
         .child(el().h_full().w(((w - 3.2 * scale - 2.4) * level).max(1.5)).radius(1.6 * scale).fill(color));
     let mut r = row().gap(2.0).items_center()
         .child(body)
-        .child(el().size(2.0 * scale, 5.0 * scale).radius(1.0).fill(Color::WHITE.alpha(0.42)));
+        .child(el().size(2.0 * scale, 5.0 * scale).radius(1.0).fill(look::ink(0.42)));
     if b.charging {
         r = r.child(icon(&icons::BOLT, 12.0 * scale).color(color));
+    } else if b.plugged {
+        // On the charger but not charging (full, or held by the firmware).
+        r = r.child(icon(&icons::PLUG, 12.0 * scale).color(color));
     }
     r.child(text(format!("{}%", b.level)).font(TextStyle::new(11.0 * scale, 600.0)).color(look::dim()).ml(3.0))
 }
@@ -338,9 +432,9 @@ fn rail(s: &State) -> El {
         let active = i == s.active;
         let attention = tab.panes().iter().any(|id| s.needs_attention(*id));
         let mut tile = el().key(format!("rail-tab-{i}")).size(42.0, 42.0).radius(13.0).center()
-            .fill(if active { Color::WHITE.alpha(0.1) } else { Color::WHITE.alpha(0.035) })
-            .border(1.0, if active { Color::WHITE.alpha(0.1) } else { Color::TRANSPARENT })
-            .hover(Color::WHITE.alpha(0.06)).cursor(Cursor::Pointer)
+            .fill(if active { look::ink(0.1) } else { look::ink(0.035) })
+            .border(1.0, if active { look::ink(0.1) } else { Color::TRANSPARENT })
+            .hover(look::ink(0.06)).cursor(Cursor::Pointer)
             .on_press(move |s: &mut State| s.select_tab(i))
             .child(text(format!("{}", i + 1)).font(TextStyle::new(14.0, 650.0)).color(if active { look::text() } else { look::dim() }));
         if attention {
@@ -356,15 +450,21 @@ fn rail(s: &State) -> El {
         tabs = tabs.child(tile);
     }
     let plus = el().key("rail-new-tab").size(42.0, 42.0).radius(13.0).center()
-        .hover(Color::WHITE.alpha(0.06)).cursor(Cursor::Pointer)
+        .hover(look::ink(0.06)).cursor(Cursor::Pointer)
         .on_press(|s: &mut State| s.new_tab_here())
         .child(icon(&icons::PLUS, 17.0).color(look::dim()));
+    let light = s.light;
+    let mode = el().key("rail-mode").size(42.0, 42.0).radius(13.0).center()
+        .hover(look::ink(0.06)).cursor(Cursor::Pointer)
+        .help(if light { "Dark mode" } else { "Light mode" })
+        .on_press(move |s: &mut State| s.set_light(!light))
+        .child(icon(if light { &icons::MOON } else { &icons::SUN }, 16.0).color(look::dim()));
     col().w(w).h_full().py(14.0).gap(16.0).items_center()
         .child(top)
-        .child(el().w(26.0).h(1.0).fill(Color::WHITE.alpha(0.07)))
+        .child(el().w(26.0).h(1.0).fill(look::ink(0.07)))
         .child(tabs)
         .child(el().grow(1.0))
-        .child(plus)
+        .child(col().gap(4.0).items_center().child(mode).child(plus))
 }
 
 /// The open sidebar: a card for the session (badge, name, time, battery), then every tab
@@ -387,7 +487,7 @@ fn wide(s: &State) -> El {
             }))
         .child(icon(&icons::CHEVRON, 15.0).color(look::faint()));
     let mut card = col().key("session-card").w_full().p_all(14.0).gap(14.0).radius(18.0)
-        .fill(hex("#121317").unwrap())
+        .fill(look::surface(1))
         .gradient(c.alpha(0.13), c.alpha(0.02))
         .border(1.0, c.alpha(0.18))
         .child(head);
@@ -402,7 +502,7 @@ fn wide(s: &State) -> El {
         if let (true, Some(b)) = (s.sidebar.battery, s.status.battery) {
             status = status.child(battery(b, 1.0).mb(3.0));
         }
-        card = card.child(el().h(1.0).w_full().fill(Color::WHITE.alpha(0.06))).child(status);
+        card = card.child(el().h(1.0).w_full().fill(look::ink(0.06))).child(status);
     }
 
     let mut list = col().gap(6.0).w_full();
@@ -410,7 +510,7 @@ fn wide(s: &State) -> El {
         list = list.child(tab_group(s, i, tab));
     }
     let new_tab = row().key("new-tab").h(38.0).w_full().px(10.0).gap(8.0).items_center().radius(10.0)
-        .hover(Color::WHITE.alpha(0.04)).press(Color::WHITE.alpha(0.08)).cursor(Cursor::Pointer)
+        .hover(look::ink(0.04)).press(look::ink(0.08)).cursor(Cursor::Pointer)
         .on_press(|s: &mut State| s.new_tab_here())
         .child(icon(&icons::PLUS, 16.0).color(look::dim()))
         .child(text("New tab").font(BODY).color(look::dim()))
@@ -422,6 +522,51 @@ fn wide(s: &State) -> El {
         .child(list)
         .child(el().grow(1.0))
         .child(new_tab)
+        .child(appearance(s))
+}
+
+fn rgb_color(c: crate::vt::Rgb) -> Color {
+    hex(&format!("#{:02x}{:02x}{:02x}", c.0, c.1, c.2)).unwrap()
+}
+
+/// Light or dark: a sun and a moon, the current one raised.
+fn mode_switch(s: &State) -> El {
+    let half = |light: bool| {
+        let on = s.light == light;
+        el().key(format!("mode-{}", if light { "light" } else { "dark" })).size(30.0, 26.0).radius(8.0).center()
+            .fill(if on { look::surface(3) } else { Color::TRANSPARENT })
+            .border(1.0, if on { look::ink(0.08) } else { Color::TRANSPARENT })
+            .shadow(1.0, 3.0, look::shade(if on { 0.25 } else { 0.0 }))
+            .cursor(Cursor::Pointer)
+            .help(if light { "Light" } else { "Dark" })
+            .on_press(move |s: &mut State| s.set_light(light))
+            .child(icon(if light { &icons::SUN } else { &icons::MOON }, 14.0).color(if on { look::text() } else { look::faint() }))
+    };
+    row().p_all(2.0).gap(2.0).radius(10.0).fill(look::ink(0.05)).child(half(false)).child(half(true))
+}
+
+/// The bottom of the open sidebar: accent swatches and light or dark.
+fn appearance(s: &State) -> El {
+    let mut swatches = row().gap(6.0).items_center().grow(1.0).flex_wrap();
+    for &c in &s.accents {
+        let on = c == s.accent;
+        let color = rgb_color(c);
+        swatches = swatches.child(
+            el().key(format!("accent-{}", crate::config::hex_of(c))).size(18.0, 18.0).radius(9.0).center()
+                .fill(color)
+                .border(2.0, if on { look::text() } else { Color::TRANSPARENT })
+                .shadow(0.0, if on { 10.0 } else { 0.0 }, color.alpha(0.6))
+                .cursor(Cursor::Pointer)
+                .help(crate::config::hex_of(c))
+                .on_press(move |s: &mut State| s.set_accent(c)),
+        );
+    }
+    col().key("appearance").w_full().gap(8.0).p_all(10.0).radius(14.0).fill(look::ink(0.03)).border(1.0, look::ink(0.04))
+        .child(row().items_center()
+            .child(text("APPEARANCE").font(CAPS).color(look::faint()))
+            .child(el().grow(1.0))
+            .child(mode_switch(s)))
+        .child(swatches)
 }
 
 /// The sidebar. Pinned, it's always open and the splits make room. Otherwise it's a rail
@@ -438,8 +583,8 @@ fn sidebar(s: &State) -> El {
         bar = bar.on_hover_change(|s: &mut State, hovered, _| s.sidebar_open = hovered);
     }
     if open && !pinned {
-        bar = bar.fill(hex("#0b0b0d").unwrap()).border_sides([0.0, 1.0, 0.0, 0.0], Color::WHITE.alpha(0.05))
-            .shadow(0.0, 48.0, Color::BLACK.alpha(0.6));
+        bar = bar.fill(look::surface(0)).border_sides([0.0, 1.0, 0.0, 0.0], look::ink(0.05))
+            .shadow(0.0, 48.0, look::shade(0.6));
     }
     bar
 }
@@ -452,9 +597,9 @@ fn picker(s: &State, sessions: &[crate::spooky::SessionInfo]) -> El {
         mode => session_list(s, sessions, mode),
     };
     let panel = col().key("picker").absolute(s.sidebar.width + 8.0, 12.0).w(356.0).max_h(600.0).p_all(8.0).gap(4.0).radius(16.0)
-        .fill(hex("#131417").unwrap().alpha(0.96)).backdrop_blur(24.0)
-        .border(1.0, Color::WHITE.alpha(0.08))
-        .shadow(4.0, 12.0, Color::BLACK.alpha(0.45)).shadow(24.0, 64.0, Color::BLACK.alpha(0.55))
+        .fill(look::surface(2).alpha(0.96)).backdrop_blur(24.0)
+        .border(1.0, look::ink(0.08))
+        .shadow(4.0, 12.0, look::shade(0.45)).shadow(24.0, 64.0, look::shade(0.55))
         .raise()
         .transition(Transition::offset(0.0, -6.0).combined(Transition::scale(0.97)).combined(Transition::opacity()))
         .child(body);
@@ -467,9 +612,9 @@ fn picker(s: &State, sessions: &[crate::spooky::SessionInfo]) -> El {
 fn session_list(s: &State, sessions: &[crate::spooky::SessionInfo], mode: &PickerMode) -> El {
     let current = s.session.as_ref().map(|x| x.name.as_str());
     let new = row().key("picker-new").h(52.0).w_full().px(10.0).gap(12.0).items_center().radius(12.0)
-        .hover(Color::WHITE.alpha(0.05)).cursor(Cursor::Pointer)
+        .hover(look::ink(0.05)).cursor(Cursor::Pointer)
         .on_press(|s: &mut State| s.new_session())
-        .child(el().size(34.0, 34.0).radius(10.0).center().fill(Color::WHITE.alpha(0.06)).border(1.0, Color::WHITE.alpha(0.08))
+        .child(el().size(34.0, 34.0).radius(10.0).center().fill(look::ink(0.06)).border(1.0, look::ink(0.08))
             .child(icon(&icons::PLUS, 16.0).color(look::text())))
         .child(col().gap(2.0)
             .child(text("New session").font(TITLE).color(look::text()))
@@ -496,7 +641,7 @@ fn session_list(s: &State, sessions: &[crate::spooky::SessionInfo], mode: &Picke
         let (open, emoji, kill) = (info.name.clone(), info.name.clone(), info.name.clone());
         let tile = el().key(format!("picker-emoji-{}", info.name)).size(36.0, 36.0).radius(10.0).center()
             .fill(tint.alpha(0.14)).border(1.0, tint.alpha(0.26))
-            .hover(Color::WHITE.alpha(0.08)).hover_alone().cursor(Cursor::Pointer)
+            .hover(look::ink(0.08)).hover_alone().cursor(Cursor::Pointer)
             .help("Change emoji")
             .on_press(move |s: &mut State| s.choose_emoji(&emoji))
             .child(text(info.animal.clone()).font(TextStyle::new(19.0, 400.0)));
@@ -507,7 +652,7 @@ fn session_list(s: &State, sessions: &[crate::spooky::SessionInfo], mode: &Picke
             .on_press(move |s: &mut State| s.ask_kill(&kill))
             .child(icon(&icons::TRASH, 15.0).color(look::dim()));
         let mut r = row().key(format!("picker-{}", info.name)).h(54.0).w_full().pl(9.0).pr(6.0).gap(12.0).items_center().radius(12.0)
-            .hover(Color::WHITE.alpha(0.05)).hover_group().cursor(Cursor::Pointer)
+            .hover(look::ink(0.05)).hover_group().cursor(Cursor::Pointer)
             .on_press(move |s: &mut State| s.open_session(&open))
             .child(tile)
             .child(col().gap(2.0).grow(1.0).min_w(0.0)
@@ -517,7 +662,7 @@ fn session_list(s: &State, sessions: &[crate::spooky::SessionInfo], mode: &Picke
                 .child(text(label).font(CAPS).color(tint)))
             .child(trash);
         if here {
-            r = r.fill(Color::WHITE.alpha(0.04));
+            r = r.fill(look::ink(0.04));
         }
         list = list.child(r);
     }
@@ -527,7 +672,7 @@ fn session_list(s: &State, sessions: &[crate::spooky::SessionInfo], mode: &Picke
             .child(el().grow(1.0))
             .child(text("spooky").font(CAPS).color(look::faint().alpha(0.7))))
         .child(new)
-        .child(el().h(1.0).w_full().my(4.0).fill(Color::WHITE.alpha(0.06)))
+        .child(el().h(1.0).w_full().my(4.0).fill(look::ink(0.06)))
         .child(list)
 }
 
@@ -536,7 +681,7 @@ fn confirm_kill(info: &crate::spooky::SessionInfo, panes: &str) -> El {
     let red = hex("#ff6b6b").unwrap();
     let name = info.name.clone();
     let button = |key: String, label: &str, fill: Color, color: Color| {
-        el().key(key).h(28.0).px(12.0).radius(8.0).center().fill(fill).hover(Color::WHITE.alpha(0.08)).cursor(Cursor::Pointer)
+        el().key(key).h(28.0).px(12.0).radius(8.0).center().fill(fill).hover(look::ink(0.08)).cursor(Cursor::Pointer)
             .child(text(label.to_string()).font(TextStyle::new(12.0, 600.0)).color(color))
     };
     row().key(format!("picker-confirm-{}", info.name)).h(54.0).w_full().px(10.0).gap(10.0).items_center().radius(12.0)
@@ -545,7 +690,7 @@ fn confirm_kill(info: &crate::spooky::SessionInfo, panes: &str) -> El {
         .child(col().gap(2.0).grow(1.0).min_w(0.0)
             .child(text(format!("Kill {}?", info.name)).font(TITLE).color(look::text()).single_line().truncate())
             .child(text(format!("Ends its {panes}")).font(SMALL).color(look::dim()).single_line()))
-        .child(button(format!("cancel-kill-{}", info.name), "Cancel", Color::WHITE.alpha(0.06), look::text()).on_press(|s: &mut State| s.cancel_kill()))
+        .child(button(format!("cancel-kill-{}", info.name), "Cancel", look::ink(0.06), look::text()).on_press(|s: &mut State| s.cancel_kill()))
         .child(button(format!("do-kill-{}", info.name), "Kill", red.alpha(0.9), Color::WHITE).on_press(move |s: &mut State| s.kill_session(&name)))
 }
 
@@ -559,7 +704,7 @@ fn emoji_grid(sessions: &[crate::spooky::SessionInfo], session: &str, animals: &
             let (session, name) = (session.to_string(), name.clone());
             let chosen = *glyph == current;
             let mut cell = el().key(format!("emoji-{name}")).size(42.0, 42.0).radius(11.0).center()
-                .hover(Color::WHITE.alpha(0.08)).press(Color::WHITE.alpha(0.12)).cursor(Cursor::Pointer)
+                .hover(look::ink(0.08)).press(look::ink(0.12)).cursor(Cursor::Pointer)
                 .help(name.clone())
                 .on_press(move |s: &mut State| s.set_emoji(&session, &name))
                 .child(text(glyph.clone()).font(TextStyle::new(22.0, 400.0)));
@@ -573,7 +718,7 @@ fn emoji_grid(sessions: &[crate::spooky::SessionInfo], session: &str, animals: &
             .child(grid)
     };
     let back = el().key("emoji-back").size(28.0, 28.0).radius(8.0).center()
-        .hover(Color::WHITE.alpha(0.08)).cursor(Cursor::Pointer)
+        .hover(look::ink(0.08)).cursor(Cursor::Pointer)
         .on_press(|s: &mut State| s.cancel_kill())
         .child(icon(&icons::BACK, 16.0).color(look::dim()));
     let mut c = col().w_full().gap(10.0).p_all(2.0)
@@ -600,13 +745,13 @@ fn pill(s: &State, m: &crate::state::Minimized) -> El {
     let attention = s.needs_attention(id);
     let mut r = row().key(format!("pill-{id}")).matched(format!("pane-{id}"))
         .h(40.0).pl(8.0).pr(14.0).gap(9.0).items_center().radius(20.0)
-        .fill(hex("#16171a").unwrap().alpha(0.92))
+        .fill(look::surface(3).alpha(0.92))
         .backdrop_blur(18.0)
-        .border(1.0, if attention { look::attention().alpha(0.5) } else { Color::WHITE.alpha(0.09) })
-        .shadow(2.0, 6.0, Color::BLACK.alpha(0.4))
-        .shadow(14.0, 40.0, Color::BLACK.alpha(0.5))
+        .border(1.0, if attention { look::attention().alpha(0.5) } else { look::ink(0.09) })
+        .shadow(2.0, 6.0, look::shade(0.4))
+        .shadow(14.0, 40.0, look::shade(0.5))
         .offset(m.offset.0, m.offset.1)
-        .hover(Color::WHITE.alpha(0.04))
+        .hover(look::ink(0.04))
         .cursor(Cursor::Grab)
         .transition(Transition::offset(0.0, 16.0).combined(Transition::scale(0.9)).combined(Transition::opacity()))
         .help("Drag to move · click to restore")
@@ -638,9 +783,11 @@ fn pill(s: &State, m: &crate::state::Minimized) -> El {
 }
 
 pub fn view(s: &State, _: &mut Cx<State>) -> El {
+    let a = s.accent;
+    look::set(s.light, hex(&format!("#{:02x}{:02x}{:02x}", a.0, a.1, a.2)).unwrap());
     let main = match s.tab() {
         Some(tab) if tab.zoomed => pane(s, tab, tab.focused),
-        Some(tab) => node(s, tab, &tab.root),
+        Some(tab) => node(s, tab, &tab.root, vec![]),
         None => el(),
     };
     // Each tab is its own layer, keyed by the tab: switching tabs slides the new one in from
@@ -664,6 +811,7 @@ pub fn view(s: &State, _: &mut Cx<State>) -> El {
         stage = stage.child(el().pin(Some(0.0), None, Some(0.0), Some(18.0)).child(row().w_full().justify_center().child(dock)));
     }
     let mut root = el().w_full().h_full().fill(look::window()).motion(motion::GLIDE)
+        .on_window_focus(|s: &mut State, focused, _: &mut Tx| s.window_focused = focused)
         .child(row().w_full().h_full().pl(if s.sidebar.pinned { s.sidebar.width } else { s.sidebar.rail }).py(look::GAP).pr(look::GAP).child(stage))
         .child(sidebar(s));
     if let Some(sessions) = &s.picker {
@@ -682,7 +830,7 @@ pub fn spec() -> AppSpec<State> {
             tx.wake_after(std::time::Duration::from_secs(5));
             s.poll(t)
         }),
-        on_key: Some(|s, e, _: &mut Tx| s.key(e)),
+        on_key: Some(|s, e, tx: &mut Tx| s.key(e, tx)),
         scenes: &[
             ("demo", demo),
             ("sidebar", |s| s.sidebar_open = true),

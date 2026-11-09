@@ -21,6 +21,7 @@ struct Events {
     sink: Sink,
     changed: Arc<AtomicBool>,
     attention: Arc<AtomicBool>,
+    note: Arc<Mutex<Option<(String, String)>>>,
 }
 
 impl vt::Handler for Events {
@@ -37,7 +38,8 @@ impl vt::Handler for Events {
         self.attention.store(true, Ordering::Release);
         self.changed.store(true, Ordering::Release);
     }
-    fn notify(&mut self, _title: &str, _body: &str) {
+    fn notify(&mut self, title: &str, body: &str) {
+        *self.note.lock().unwrap() = Some((title.to_string(), body.to_string()));
         self.attention.store(true, Ordering::Release);
         self.changed.store(true, Ordering::Release);
     }
@@ -87,6 +89,8 @@ pub struct Pane {
     /// Set by a bell or a desktop notification: the program wants the user (an agent waiting
     /// for input, a finished build). Cleared when the user comes to the pane.
     pub attention: Arc<AtomicBool>,
+    /// The last desktop notification the program sent (title, body), for ours.
+    pub note: Arc<Mutex<Option<(String, String)>>>,
     /// Shown in the header: the foreground program and the working directory.
     pub program: String,
     pub cwd: String,
@@ -102,8 +106,8 @@ impl Drop for Pane {
     }
 }
 
-fn new_terminal(sink: Sink, theme: &Theme, changed: Arc<AtomicBool>, attention: Arc<AtomicBool>) -> Arc<Mutex<Terminal>> {
-    let mut term = Terminal::new(80, 24, Events { sink, changed, attention });
+fn new_terminal(sink: Sink, theme: &Theme, changed: Arc<AtomicBool>, attention: Arc<AtomicBool>, note: Arc<Mutex<Option<(String, String)>>>) -> Arc<Mutex<Terminal>> {
+    let mut term = Terminal::new(80, 24, Events { sink, changed, attention, note });
     term.set_colors(theme.fg, theme.bg, theme.cursor, &theme.ansi);
     term.set_scrollback_bytes(16 << 20);
     term.set_default_cursor(theme.cursor_style, true);
@@ -120,6 +124,7 @@ impl Pane {
         };
         let meta_changed = Arc::new(AtomicBool::new(true));
         let attention = Arc::new(AtomicBool::new(false));
+        let note = Arc::new(Mutex::new(None));
         let dirty = Arc::new(AtomicBool::new(true));
         let exited = Arc::new(AtomicBool::new(false));
         let stolen = Arc::new(AtomicBool::new(false));
@@ -145,7 +150,7 @@ impl Pane {
                 let sink: Sink = Arc::new(move |b: &[u8]| {
                     let _ = spooky::write_frame(&mut *out.lock().unwrap(), spooky::tag::INPUT, b);
                 });
-                let term = new_terminal(sink.clone(), theme, meta_changed.clone(), attention.clone());
+                let term = new_terminal(sink.clone(), theme, meta_changed.clone(), attention.clone(), note.clone());
                 let (t, d, e, s, sid) = (term.clone(), dirty.clone(), exited.clone(), stolen.clone(), spooky_id.clone());
                 std::thread::Builder::new().name(format!("spooky-pane-{id}")).spawn(move || {
                     let mut frames = spooky::Frames::default();
@@ -204,7 +209,7 @@ impl Pane {
                 let sink: Sink = Arc::new(move |b: &[u8]| {
                     let _ = writer.lock().unwrap().write_all(b);
                 });
-                let term = new_terminal(sink.clone(), theme, meta_changed.clone(), attention.clone());
+                let term = new_terminal(sink.clone(), theme, meta_changed.clone(), attention.clone(), note.clone());
                 let mut reader = pair.master.try_clone_reader().map_err(std::io::Error::other)?;
                 let (t, d, e) = (term.clone(), dirty.clone(), exited.clone());
                 std::thread::Builder::new().name(format!("pty-{id}")).spawn(move || {
@@ -242,6 +247,7 @@ impl Pane {
             exited,
             stolen,
             attention,
+            note,
             program,
             cwd: cwd.map(|d| tilde(&d)).unwrap_or_default(),
             cleanup: None,

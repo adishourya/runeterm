@@ -69,6 +69,17 @@ impl Node {
         }
     }
 
+    /// Sets the ratio of the split at `path` (false: into `a`, true: into `b`).
+    pub fn set_ratio(&mut self, path: &[bool], r: f32) {
+        if let Node::Split { ratio, a, b, .. } = self {
+            match path.split_first() {
+                None => *ratio = r,
+                Some((false, rest)) => a.set_ratio(rest, r),
+                Some((true, rest)) => b.set_ratio(rest, r),
+            }
+        }
+    }
+
     /// Swaps two leaves' places.
     pub fn swap(&mut self, a: u32, b: u32) {
         match self {

@@ -35,4 +35,7 @@ branch); without a daemon, runeterm runs plain local shells (`RUNETERM_LOCAL=1` 
 - Keys: ⌥[ / ⌥- split, ⌥h/j/k/l focus, ⌥⇧h/j/k/l swap, ⌥w/a/s/d resize, ⌥↩ zoom, ⌥M minimize,
   ⌥X close, ⌥T new tab, ⌥1–9 tabs, ⌥/ pin or unpin the sidebar, ⌥E open the scrollback in
   an editor (`scrollback-editor`).
+- Mouse: drag to select (twice for a word, three times for a line), Ctrl+Shift+C / Ctrl+Shift+V
+  copy and paste, middle-click pastes the selection, Ctrl+click opens links, drag the gap between
+  splits to resize them. Programs that use the mouse get it; hold Shift to select instead.
 - Crashes are logged to `~/.local/state/runeterm/crash.log`.

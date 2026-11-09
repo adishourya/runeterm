@@ -244,6 +244,93 @@ impl Terminal {
         }
     }
 
+    /// The cell at viewport column `x`, row `y`.
+    pub fn cell_ref(&self, x: u16, y: u16) -> Option<sys::GhosttyGridRef> {
+        // SAFETY: a tagged point of a known tag; the ref is only valid until the terminal changes.
+        unsafe {
+            let mut p: sys::GhosttyPoint = mem::zeroed();
+            p.tag = sys::GHOSTTY_POINT_TAG_VIEWPORT;
+            p.value.coordinate.x = x;
+            p.value.coordinate.y = y as _;
+            let mut r: sys::GhosttyGridRef = mem::zeroed();
+            (sys::ghostty_terminal_grid_ref(self.raw, p, &mut r) == sys::GHOSTTY_SUCCESS).then_some(r)
+        }
+    }
+
+    /// Shows `sel` as the terminal's selection (None clears it).
+    pub fn set_selection(&mut self, sel: Option<&sys::GhosttySelection>) {
+        let v = sel.map_or(ptr::null(), |s| s as *const _ as *const c_void);
+        // SAFETY: SELECTION takes a GhosttySelection* or NULL.
+        unsafe { sys::ghostty_terminal_set(self.raw, sys::GHOSTTY_TERMINAL_OPT_SELECTION, v) };
+    }
+
+    pub fn selection(&self) -> Option<sys::GhosttySelection> {
+        // SAFETY: SELECTION writes a GhosttySelection when there is one.
+        unsafe {
+            let mut s: sys::GhosttySelection = mem::zeroed();
+            (sys::ghostty_terminal_get(self.raw, sys::GHOSTTY_TERMINAL_DATA_SELECTION, &mut s as *mut _ as *mut c_void) == sys::GHOSTTY_SUCCESS)
+                .then_some(s)
+        }
+    }
+
+    /// The text of a selection (soft wraps joined, trailing blanks trimmed).
+    pub fn text_of(&self, sel: &sys::GhosttySelection) -> String {
+        // SAFETY: as `text`, with the selection borrowed for the call.
+        unsafe {
+            let mut f: sys::GhosttyFormatter = ptr::null_mut();
+            if sys::ghostty_formatter_terminal_new(ptr::null(), &mut f, self.raw) != sys::GHOSTTY_SUCCESS {
+                return String::new();
+            }
+            let yes = true;
+            sys::ghostty_formatter_set(f, sys::GHOSTTY_FORMATTER_OPT_UNWRAP, &yes as *const _ as *const c_void);
+            sys::ghostty_formatter_set(f, sys::GHOSTTY_FORMATTER_OPT_SELECTION, sel as *const _ as *const c_void);
+            let (mut out, mut len) = (ptr::null_mut(), 0usize);
+            let r = sys::ghostty_formatter_format_alloc(f, ptr::null(), &mut out, &mut len);
+            let text = if r == sys::GHOSTTY_SUCCESS && !out.is_null() {
+                let t = String::from_utf8_lossy(std::slice::from_raw_parts(out, len)).into_owned();
+                sys::ghostty_free(ptr::null(), out, len);
+                t
+            } else {
+                String::new()
+            };
+            sys::ghostty_formatter_free(f);
+            text
+        }
+    }
+
+    /// The selected text, if anything is selected.
+    pub fn selection_text(&self) -> Option<String> {
+        self.selection().map(|s| self.text_of(&s)).filter(|t| !t.is_empty())
+    }
+
+    /// Viewport row `y` as text, untrimmed so columns line up with characters.
+    pub fn row_text(&self, y: u16) -> String {
+        let (cols, _) = self.size();
+        let (Some(a), Some(b)) = (self.cell_ref(0, y), self.cell_ref(cols.saturating_sub(1), y)) else { return String::new() };
+        // SAFETY: a zeroed selection with both ends set is a valid one.
+        let mut sel: sys::GhosttySelection = unsafe { mem::zeroed() };
+        sel.start = a;
+        sel.end = b;
+        self.text_of(&sel)
+    }
+
+    /// The OSC 8 hyperlink of the cell at viewport (`x`, `y`).
+    pub fn hyperlink_at(&self, x: u16, y: u16) -> Option<String> {
+        let r = self.cell_ref(x, y)?;
+        // SAFETY: the first call measures; the second fills a buffer of that size.
+        unsafe {
+            let mut len = 0usize;
+            sys::ghostty_grid_ref_hyperlink_uri(&r, ptr::null_mut(), 0, &mut len);
+            if len == 0 {
+                return None;
+            }
+            let mut buf = vec![0u8; len];
+            sys::ghostty_grid_ref_hyperlink_uri(&r, buf.as_mut_ptr(), len, &mut len);
+            buf.truncate(len);
+            Some(String::from_utf8_lossy(&buf).into_owned()).filter(|u| !u.is_empty())
+        }
+    }
+
     /// Scrolls the viewport by `rows` (negative is up, into scrollback).
     pub fn scroll(&mut self, rows: isize) {
         let mut b = sys::GhosttyTerminalScrollViewport::default();
@@ -312,6 +399,189 @@ impl Terminal {
             sys::ghostty_terminal_get(self.raw, sys::GHOSTTY_TERMINAL_DATA_ROWS, &mut r as *mut _ as *mut c_void);
         }
         (c, r)
+    }
+}
+
+/// Where a pointer is over a terminal: its cell, its position in pixels from the grid's
+/// top-left (padding included), and the grid's geometry.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PointerAt {
+    pub col: u16,
+    pub row: u16,
+    pub px: f64,
+    pub py: f64,
+    pub cols: u16,
+    pub rows: u16,
+    pub cell_w: u32,
+    pub cell_h: u32,
+    pub pad: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Mouse selection: presses, drags and releases in, the selection out. Clicking twice selects
+/// a word, three times a line.
+pub struct Gesture {
+    raw: sys::GhosttySelectionGesture,
+    events: [sys::GhosttySelectionGestureEvent; 3],
+    epoch: std::time::Instant,
+}
+
+// SAFETY: owned handles, used from one thread at a time.
+unsafe impl Send for Gesture {}
+
+pub enum GestureKind {
+    Press,
+    Drag,
+    Release,
+}
+
+impl Default for Gesture {
+    fn default() -> Self {
+        let mut raw = ptr::null_mut();
+        let mut ev = [ptr::null_mut(); 3];
+        // SAFETY: default allocator; freed in `free`.
+        unsafe {
+            sys::ghostty_selection_gesture_new(ptr::null(), &mut raw);
+            for (i, t) in [
+                sys::GHOSTTY_SELECTION_GESTURE_EVENT_TYPE_PRESS,
+                sys::GHOSTTY_SELECTION_GESTURE_EVENT_TYPE_DRAG,
+                sys::GHOSTTY_SELECTION_GESTURE_EVENT_TYPE_RELEASE,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                sys::ghostty_selection_gesture_event_new(ptr::null(), &mut ev[i], t);
+            }
+        }
+        Gesture { raw, events: ev, epoch: std::time::Instant::now() }
+    }
+}
+
+impl Gesture {
+    /// Feeds one pointer event; returns the selection it makes, if it makes one.
+    pub fn event(&mut self, t: &Terminal, kind: GestureKind, at: PointerAt) -> Option<sys::GhosttySelection> {
+        let r = t.cell_ref(at.col.min(at.cols.saturating_sub(1)), at.row.min(at.rows.saturating_sub(1)))?;
+        let ev = self.events[kind as usize];
+        let pos = sys::GhosttySurfacePosition { x: at.px, y: at.py };
+        let ns = self.epoch.elapsed().as_nanos() as u64;
+        let geom = sys::GhosttySelectionGestureGeometry {
+            columns: at.cols.max(1) as u32,
+            cell_width: at.cell_w.max(1),
+            padding_left: at.pad,
+            screen_height: at.height.max(1),
+        };
+        // SAFETY: each option's value has the type the header documents.
+        unsafe {
+            sys::ghostty_selection_gesture_event_set(ev, sys::GHOSTTY_SELECTION_GESTURE_EVENT_OPT_REF, &r as *const _ as *const c_void);
+            sys::ghostty_selection_gesture_event_set(ev, sys::GHOSTTY_SELECTION_GESTURE_EVENT_OPT_POSITION, &pos as *const _ as *const c_void);
+            sys::ghostty_selection_gesture_event_set(ev, sys::GHOSTTY_SELECTION_GESTURE_EVENT_OPT_TIME_NS, &ns as *const _ as *const c_void);
+            sys::ghostty_selection_gesture_event_set(ev, sys::GHOSTTY_SELECTION_GESTURE_EVENT_OPT_GEOMETRY, &geom as *const _ as *const c_void);
+            // Double and triple clicks: within 400 ms and 8 px of the last press.
+            let (interval, distance) = (400_000_000u64, 8.0f64);
+            sys::ghostty_selection_gesture_event_set(ev, sys::GHOSTTY_SELECTION_GESTURE_EVENT_OPT_REPEAT_INTERVAL_NS, &interval as *const _ as *const c_void);
+            sys::ghostty_selection_gesture_event_set(ev, sys::GHOSTTY_SELECTION_GESTURE_EVENT_OPT_REPEAT_DISTANCE, &distance as *const _ as *const c_void);
+            let mut out: sys::GhosttySelection = mem::zeroed();
+            (sys::ghostty_selection_gesture_event(self.raw, t.raw, ev, &mut out) == sys::GHOSTTY_SUCCESS).then_some(out)
+        }
+    }
+
+    /// Whether the last press moved far enough to be a drag (rather than a click).
+    pub fn dragged(&self, t: &Terminal) -> bool {
+        let mut d = false;
+        // SAFETY: DRAGGED writes a bool.
+        unsafe { sys::ghostty_selection_gesture_get(self.raw, t.raw, sys::GHOSTTY_SELECTION_GESTURE_DATA_DRAGGED, &mut d as *mut _ as *mut c_void) };
+        d
+    }
+
+    /// Frees the gesture; it needs the terminal it tracked.
+    pub fn free(self, t: &Terminal) {
+        // SAFETY: freed once, with its terminal.
+        unsafe {
+            for e in self.events {
+                sys::ghostty_selection_gesture_event_free(e);
+            }
+            sys::ghostty_selection_gesture_free(self.raw, t.raw);
+        }
+    }
+}
+
+/// Mouse events for programs that asked for them (htop, editors with the mouse on), encoded
+/// the way they asked.
+pub struct MouseEncoder {
+    enc: sys::GhosttyMouseEncoder,
+    ev: sys::GhosttyMouseEvent,
+}
+
+// SAFETY: owned handles, used from one thread at a time.
+unsafe impl Send for MouseEncoder {}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MouseAction {
+    Press,
+    Release,
+    Motion,
+}
+
+impl Default for MouseEncoder {
+    fn default() -> Self {
+        let (mut enc, mut ev) = (ptr::null_mut(), ptr::null_mut());
+        // SAFETY: default allocator; freed in Drop.
+        unsafe {
+            sys::ghostty_mouse_encoder_new(ptr::null(), &mut enc);
+            sys::ghostty_mouse_event_new(ptr::null(), &mut ev);
+        }
+        MouseEncoder { enc, ev }
+    }
+}
+
+impl MouseEncoder {
+    /// `button` is 1 left, 2 right, 3 middle, 4/5 wheel up/down; 0 for motion with none held.
+    pub fn encode(&mut self, t: &Terminal, action: MouseAction, button: u32, mods: Mods, at: PointerAt) -> Vec<u8> {
+        let mut buf = [0u8; 64];
+        let mut n = 0usize;
+        // SAFETY: plain values into owned handles.
+        unsafe {
+            sys::ghostty_mouse_encoder_set_from_terminal(self.enc, t.raw);
+            let mut size: sys::GhosttyMouseEncoderSize = mem::zeroed();
+            size.size = mem::size_of_val(&size);
+            size.screen_width = at.width;
+            size.screen_height = at.height;
+            size.cell_width = at.cell_w.max(1);
+            size.cell_height = at.cell_h.max(1);
+            size.padding_top = at.pad;
+            size.padding_bottom = at.pad;
+            size.padding_left = at.pad;
+            size.padding_right = at.pad;
+            sys::ghostty_mouse_encoder_set(self.enc, sys::GHOSTTY_MOUSE_ENCODER_OPT_SIZE, &size as *const _ as *const c_void);
+            sys::ghostty_mouse_event_set_action(
+                self.ev,
+                match action {
+                    MouseAction::Press => sys::GHOSTTY_MOUSE_ACTION_PRESS,
+                    MouseAction::Release => sys::GHOSTTY_MOUSE_ACTION_RELEASE,
+                    MouseAction::Motion => sys::GHOSTTY_MOUSE_ACTION_MOTION,
+                },
+            );
+            if button == 0 {
+                sys::ghostty_mouse_event_clear_button(self.ev);
+            } else {
+                sys::ghostty_mouse_event_set_button(self.ev, button as sys::GhosttyMouseButton);
+            }
+            sys::ghostty_mouse_event_set_mods(self.ev, mods.bits());
+            sys::ghostty_mouse_event_set_position(self.ev, sys::GhosttyMousePosition { x: at.px as f32, y: at.py as f32 });
+            sys::ghostty_mouse_encoder_encode(self.enc, self.ev, buf.as_mut_ptr(), buf.len(), &mut n);
+        }
+        buf[..n.min(buf.len())].to_vec()
+    }
+}
+
+impl Drop for MouseEncoder {
+    fn drop(&mut self) {
+        // SAFETY: freed once.
+        unsafe {
+            sys::ghostty_mouse_event_free(self.ev);
+            sys::ghostty_mouse_encoder_free(self.enc);
+        }
     }
 }
 
@@ -798,6 +1068,55 @@ mod tests {
         let text = t.text();
         assert!(text.contains("line 0"), "scrolled-off lines are there: {text:?}");
         assert!(text.contains("line 9"));
+    }
+
+    fn at(t: &Terminal, col: u16, row: u16) -> PointerAt {
+        let (cols, rows) = t.size();
+        PointerAt { col, row, px: col as f64 * 10.0 + 5.0, py: row as f64 * 20.0 + 10.0, cols, rows, cell_w: 10, cell_h: 20, pad: 0, width: cols as u32 * 10, height: rows as u32 * 20 }
+    }
+
+    #[test]
+    fn dragging_selects_and_double_click_picks_a_word() {
+        let mut t = Terminal::new(20, 3, Rec::default());
+        t.resize(20, 3, 10, 20);
+        t.write(b"hello brave world");
+        let mut g = Gesture::default();
+        assert!(g.event(&t, GestureKind::Press, at(&t, 0, 0)).is_none());
+        // Past the middle of the "o": a cell joins once the pointer passes its midpoint.
+        let sel = g.event(&t, GestureKind::Drag, PointerAt { px: 48.0, ..at(&t, 4, 0) }).expect("a drag selects");
+        t.set_selection(Some(&sel));
+        assert_eq!(t.selection_text().as_deref(), Some("hello"));
+        g.event(&t, GestureKind::Release, at(&t, 4, 0));
+        assert!(g.dragged(&t));
+        // Two quick presses on "brave".
+        g.event(&t, GestureKind::Press, at(&t, 7, 0));
+        g.event(&t, GestureKind::Release, at(&t, 7, 0));
+        let word = g.event(&t, GestureKind::Press, at(&t, 7, 0)).expect("a double click selects a word");
+        t.set_selection(Some(&word));
+        assert_eq!(t.selection_text().as_deref(), Some("brave"));
+        t.set_selection(None);
+        assert_eq!(t.selection_text(), None);
+        g.free(&t);
+    }
+
+    #[test]
+    fn reads_rows_and_hyperlinks() {
+        let mut t = Terminal::new(30, 2, Rec::default());
+        t.write(b"see \x1b]8;;https://ghostty.org\x1b\\docs\x1b]8;;\x1b\\ now");
+        assert!(t.row_text(0).starts_with("see docs now"));
+        assert_eq!(t.hyperlink_at(5, 0).as_deref(), Some("https://ghostty.org"));
+        assert_eq!(t.hyperlink_at(0, 0), None);
+    }
+
+    #[test]
+    fn encodes_mouse_clicks_for_programs_that_ask() {
+        let mut t = Terminal::new(20, 3, Rec::default());
+        t.resize(20, 3, 10, 20);
+        let mut m = MouseEncoder::default();
+        assert!(m.encode(&t, MouseAction::Press, 1, Mods::default(), at(&t, 2, 1)).is_empty(), "nothing without tracking");
+        t.write(b"\x1b[?1000h\x1b[?1006h");
+        assert!(t.mouse_tracking());
+        assert_eq!(m.encode(&t, MouseAction::Press, 1, Mods::default(), at(&t, 2, 1)), b"\x1b[<0;3;2M");
     }
 
     #[test]

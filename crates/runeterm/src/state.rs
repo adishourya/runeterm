@@ -7,7 +7,7 @@ use crate::spooky::{self, Controller, Event, SessionInfo};
 use crate::split::{Dir, Node, Place, Side};
 use crate::vt::{self, KeyEncoder};
 use ghostty_vt_sys as sys;
-use rune::Waker;
+use rune::{Tx, Waker};
 use rune::edit::{Key, KeyEvent};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -78,6 +78,20 @@ pub struct State {
     pub user_host: String,
     /// The editor ⌥E opens the scrollback in.
     pub scrollback_editor: String,
+    /// Mouse selection per pane, mouse reports for programs that asked, and the last selected
+    /// text (middle-click pastes it, like X's primary selection).
+    gestures: HashMap<u32, vt::Gesture>,
+    mouse: vt::MouseEncoder,
+    primary: String,
+    /// A split asked to close while running something, waiting for a yes.
+    pub confirm_close: Option<u32>,
+    /// Panes a desktop notification went out for, until they're seen.
+    notified: std::collections::HashSet<u32>,
+    pub settings: Behaviour,
+    /// Appearance: light mode, the accent, and the accents to choose from.
+    pub light: bool,
+    pub accent: crate::vt::Rgb,
+    pub accents: Vec<crate::vt::Rgb>,
     /// The spooky session this window is, once the daemon has named it.
     pub session: Option<Session>,
     /// Whether the window has keyboard focus (for the cursor and shaders' `iFocus`).
@@ -113,7 +127,7 @@ impl State {
     /// With `use_spooky`, panes live in the spooky daemon and this window is a session: `attach`
     /// names one to open, otherwise a new one starts.
     pub fn new(config: &Config, use_spooky: bool, attach: Option<String>) -> State {
-        let theme = Theme { ansi: config.theme.ansi, cursor_style: config.cursor_style, ..config.theme };
+        let theme = config.colors();
         let controller = if use_spooky {
             match Controller::connect(wake) {
                 Ok(c) => Some(c),
@@ -150,6 +164,15 @@ impl State {
             next_tab: 0,
             user_host: user_host(),
             scrollback_editor: config.scrollback_editor.clone(),
+            gestures: HashMap::new(),
+            mouse: vt::MouseEncoder::default(),
+            primary: String::new(),
+            confirm_close: None,
+            notified: Default::default(),
+            settings: Behaviour::from(config),
+            light: config.light,
+            accent: config.accent,
+            accents: config.accents.clone(),
             session: None,
             window_focused: true,
             sidebar_open: false,
@@ -287,6 +310,17 @@ impl State {
         }
     }
 
+    /// Closes a split, asking first when something other than the shell is running in it.
+    pub fn request_close(&mut self, id: u32) {
+        let busy = self.panes.get(&id).is_some_and(|p| !crate::icons::is_shell(&p.program));
+        if busy && self.settings.confirm_close {
+            self.focus(id);
+            self.confirm_close = Some(id);
+        } else {
+            self.close(id);
+        }
+    }
+
     /// Closes a split: spooky ends its pane too. Its tab closes with its last split, and the
     /// app with its last tab.
     pub fn close(&mut self, id: u32) {
@@ -301,6 +335,13 @@ impl State {
     /// Drops a split from the window without ending its pane (it ended, or another window
     /// took it).
     fn forget(&mut self, id: u32) {
+        if let (Some(g), Some(p)) = (self.gestures.remove(&id), self.panes.get(&id)) {
+            g.free(&p.term.lock().unwrap());
+        }
+        self.notified.remove(&id);
+        if self.confirm_close == Some(id) {
+            self.confirm_close = None;
+        }
         self.panes.remove(&id); // Dropping the connection detaches (or hangs up a local shell).
         let Some(t) = self.tabs.iter().position(|t| t.has(id)) else { return };
         let tab = &mut self.tabs[t];
@@ -417,6 +458,7 @@ impl State {
             }
         }
         self.report();
+        self.notify();
         changed
     }
 
@@ -586,6 +628,30 @@ impl State {
         self.active = (open.active as usize).min(self.tabs.len().saturating_sub(1));
     }
 
+    /// Light or dark, saved to the config and applied to every terminal now.
+    pub fn set_light(&mut self, light: bool) {
+        if let Err(e) = crate::config::set("theme", if light { "light" } else { "dark" }) {
+            eprintln!("runeterm: can't save the theme: {e}");
+        }
+        self.reload_config();
+    }
+
+    pub fn set_accent(&mut self, c: crate::vt::Rgb) {
+        if let Err(e) = crate::config::set("accent", &crate::config::hex_of(c)) {
+            eprintln!("runeterm: can't save the accent: {e}");
+        }
+        self.reload_config();
+    }
+
+    /// Right-click on the session badge: straight to this session's emoji.
+    pub fn choose_own_emoji(&mut self) {
+        let Some(name) = self.session.as_ref().map(|s| s.name.clone()) else { return };
+        if self.picker.is_none() {
+            self.picker = Some(spooky::sessions());
+        }
+        self.choose_emoji(&name);
+    }
+
     /// ⌥/: pins the sidebar open, or back to a rail that opens on hover.
     pub fn toggle_sidebar(&mut self) {
         self.sidebar.pinned = !self.sidebar.pinned;
@@ -630,8 +696,12 @@ impl State {
     pub fn reload_config(&mut self) {
         let c = Config::load();
         self.sidebar = c.sidebar;
+        self.settings = Behaviour::from(&c);
         self.scrollback_editor = c.scrollback_editor.clone();
-        self.theme = Theme { ansi: c.theme.ansi, cursor_style: c.cursor_style, ..c.theme };
+        self.theme = c.colors();
+        self.light = c.light;
+        self.accent = c.accent;
+        self.accents = c.accents.clone();
         for p in self.panes.values() {
             let mut t = p.term.lock().unwrap();
             t.set_colors(self.theme.fg, self.theme.bg, self.theme.cursor, &self.theme.ansi);
@@ -696,8 +766,44 @@ impl State {
 
 
     /// Keybinds first (Ghostty's, from the user's config), then everything to the focused pane.
-    pub fn key(&mut self, e: &KeyEvent) -> bool {
+    pub fn key(&mut self, e: &KeyEvent, tx: &mut Tx) -> bool {
         let m = e.mods;
+        // A close waiting for a yes takes Enter and Escape.
+        if let Some(id) = self.confirm_close {
+            match e.key {
+                Key::Enter => {
+                    self.confirm_close = None;
+                    self.close(id);
+                    return true;
+                }
+                Key::Escape => {
+                    self.confirm_close = None;
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        // Ctrl+Shift+C copies the selection, Ctrl+Shift+V pastes.
+        if m.ctrl && m.shift && !m.alt {
+            let c = match &e.key {
+                Key::Command(c) => Some(c.to_ascii_lowercase()),
+                Key::Text(t) => t.chars().next().map(|c| c.to_ascii_lowercase()),
+                _ => None,
+            };
+            match c {
+                Some('c') => {
+                    if let Some(text) = self.focused_pane().and_then(|p| p.term.lock().unwrap().selection_text()) {
+                        tx.copy(text);
+                    }
+                    return true;
+                }
+                Some('v') => {
+                    tx.read_clipboard(|s: &mut State, content, _| s.paste(content.text()));
+                    return true;
+                }
+                _ => {}
+            }
+        }
         if m.alt && !m.ctrl {
             let ch = match &e.key {
                 Key::Text(s) => s.chars().next(),
@@ -731,7 +837,7 @@ impl State {
                     true
                 }
                 Some('\n') => { let id = self.tabs[self.active].focused; self.toggle_zoom(id); true }
-                Some('x') => { let id = self.tabs[self.active].focused; self.close(id); true }
+                Some('x') => { let id = self.tabs[self.active].focused; self.request_close(id); true }
                 Some('m') => { let id = self.tabs[self.active].focused; self.minimize(id); true }
                 Some('r') => { self.reload_config(); true }
                 Some('e') => { self.edit_scrollback(); true }
@@ -753,6 +859,14 @@ impl State {
         let Some(pane) = self.focused_pane() else { return false };
         let term = pane.term.clone();
         pane.attention.store(false, Ordering::Release);
+        // Typing ends a selection, as in other terminals.
+        if !matches!(e.key, Key::Command(_)) || !m.shift {
+            let mut t = term.lock().unwrap();
+            if t.selection().is_some() {
+                t.set_selection(None);
+                pane.dirty.store(true, Ordering::Release);
+            }
+        }
         let bytes = {
             let t = term.lock().unwrap();
             let mods = vt::Mods { shift: m.shift, ctrl: m.ctrl, alt: m.alt, logo: m.logo };
@@ -792,9 +906,193 @@ impl State {
     }
 
     pub fn paste(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
         if let Some(p) = self.focused_pane() {
-            let bytes = p.term.lock().unwrap().paste_bytes(text);
+            let bytes = {
+                let mut t = p.term.lock().unwrap();
+                t.scroll_to_bottom();
+                t.paste_bytes(text)
+            };
             p.send(&bytes);
+        }
+    }
+
+    /// Where pointer `(x, y)` (the pane's grid element's points) falls in pane `id`'s terminal.
+    fn pointer_at(&self, id: u32, x: f32, y: f32) -> Option<vt::PointerAt> {
+        let g = crate::grid::geometry(id)?;
+        let (px, py) = (x * g.scale, y * g.scale);
+        let col = (((px - g.pad) / g.cell_w).floor().max(0.0) as u16).min(g.cols.saturating_sub(1));
+        let row = (((py - g.pad) / g.cell_h).floor().max(0.0) as u16).min(g.rows.saturating_sub(1));
+        Some(vt::PointerAt {
+            col,
+            row,
+            px: px as f64,
+            py: py as f64,
+            cols: g.cols,
+            rows: g.rows,
+            cell_w: g.cell_w as u32,
+            cell_h: g.cell_h as u32,
+            pad: g.pad as u32,
+            width: g.width as u32,
+            height: g.height as u32,
+        })
+    }
+
+    /// A press, drag or release on a pane's grid. Programs that track the mouse get it (Shift
+    /// takes it back for selecting); otherwise the left button selects (twice for a word,
+    /// three times for a line), Ctrl+click opens a link, and the middle button pastes the
+    /// last selection.
+    pub fn mouse(&mut self, id: u32, phase: rune::Phase, x: f32, y: f32, button: rune::PointerButton, mods: rune::Mods, tx: &mut Tx) {
+        let Some(at) = self.pointer_at(id, x, y) else { return };
+        if phase == rune::Phase::Down {
+            self.focus(id);
+        }
+        let Some(pane) = self.panes.get(&id) else { return };
+        let term = pane.term.clone();
+        let tracking = term.lock().unwrap().mouse_tracking();
+        let code = match button {
+            rune::PointerButton::Primary => 1,
+            rune::PointerButton::Secondary => 2,
+            rune::PointerButton::Middle => 3,
+            _ => return,
+        };
+        let vmods = vt::Mods { shift: mods.shift, ctrl: mods.ctrl, alt: mods.alt, logo: mods.logo };
+        if tracking && !mods.shift {
+            let action = match phase {
+                rune::Phase::Down => vt::MouseAction::Press,
+                rune::Phase::Move => vt::MouseAction::Motion,
+                rune::Phase::Up => vt::MouseAction::Release,
+            };
+            let bytes = self.mouse.encode(&term.lock().unwrap(), action, code, vmods, at);
+            pane.send(&bytes);
+            return;
+        }
+        match (code, phase) {
+            (3, rune::Phase::Down) => {
+                let text = self.primary.clone();
+                self.paste(&text);
+            }
+            (1, rune::Phase::Down) if mods.ctrl => {
+                let link = {
+                    let t = term.lock().unwrap();
+                    t.hyperlink_at(at.col, at.row).or_else(|| url_at(&t.row_text(at.row), at.col as usize))
+                };
+                if let Some(url) = link {
+                    open_link(&url);
+                }
+            }
+            (1, _) if !mods.ctrl => {
+                let kind = match phase {
+                    rune::Phase::Down => vt::GestureKind::Press,
+                    rune::Phase::Move => vt::GestureKind::Drag,
+                    rune::Phase::Up => vt::GestureKind::Release,
+                };
+                let mut t = term.lock().unwrap();
+                let g = self.gestures.entry(id).or_default();
+                if phase == rune::Phase::Down {
+                    t.set_selection(None);
+                }
+                if let Some(sel) = g.event(&t, kind, at) {
+                    t.set_selection(Some(&sel));
+                }
+                if phase == rune::Phase::Up {
+                    if let Some(text) = t.selection_text() {
+                        if self.settings.copy_on_select {
+                            tx.copy(text.clone());
+                        }
+                        self.primary = text;
+                    }
+                }
+                drop(t);
+                pane.dirty.store(true, Ordering::Release);
+            }
+            _ => {}
+        }
+    }
+
+    /// Pointer motion with no button held, for programs that track all motion.
+    pub fn mouse_moved(&mut self, id: u32, x: f32, y: f32, mods: rune::Mods) {
+        let Some(at) = self.pointer_at(id, x, y) else { return };
+        let Some(pane) = self.panes.get(&id) else { return };
+        let vmods = vt::Mods { shift: mods.shift, ctrl: mods.ctrl, alt: mods.alt, logo: mods.logo };
+        let bytes = {
+            let t = pane.term.lock().unwrap();
+            if !t.mouse_tracking() {
+                return;
+            }
+            self.mouse.encode(&t, vt::MouseAction::Motion, 0, vmods, at)
+        };
+        pane.send(&bytes);
+    }
+
+    /// The wheel: to the program when it tracks the mouse, else through the scrollback.
+    pub fn wheel(&mut self, id: u32, x: f32, y: f32, dy: f32, mods: rune::Mods) {
+        let Some(pane) = self.panes.get(&id) else { return };
+        let rows = (-dy / 20.0).round() as isize;
+        if rows == 0 {
+            return;
+        }
+        let tracking = pane.term.lock().unwrap().mouse_tracking();
+        if tracking && !mods.shift {
+            let Some(at) = self.pointer_at(id, x, y) else { return };
+            let vmods = vt::Mods { shift: mods.shift, ctrl: mods.ctrl, alt: mods.alt, logo: mods.logo };
+            let button = if rows < 0 { 4 } else { 5 };
+            let mut bytes = vec![];
+            for _ in 0..rows.unsigned_abs().min(10) {
+                bytes.extend(self.mouse.encode(&pane.term.lock().unwrap(), vt::MouseAction::Press, button, vmods, at));
+            }
+            pane.send(&bytes);
+        } else {
+            pane.term.lock().unwrap().scroll(rows);
+            pane.dirty.store(true, Ordering::Release);
+        }
+    }
+
+    /// Dragging the gap between two splits: the split at `path` (lefts are false) gets `ratio`.
+    pub fn set_ratio(&mut self, path: &[bool], ratio: f32) {
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.root.set_ratio(path, ratio.clamp(0.08, 0.92));
+        }
+    }
+
+    /// Desktop notifications for splits that want attention while the user can't see them:
+    /// the window isn't focused, or the split is in another tab or minimized.
+    fn notify(&mut self) {
+        if !self.settings.notifications {
+            return;
+        }
+        let visible: Vec<u32> = self.tab().map(|t| t.root.leaves()).unwrap_or_default();
+        let mut send = vec![];
+        for (id, p) in &self.panes {
+            let wants = p.attention.load(Ordering::Acquire);
+            if !wants {
+                self.notified.remove(id);
+                continue;
+            }
+            if self.notified.contains(id) {
+                continue;
+            }
+            if self.window_focused && visible.contains(id) {
+                continue;
+            }
+            let tab = self.tabs.iter().position(|t| t.has(*id)).map_or(0, |i| i + 1);
+            let session = self.session.as_ref().map(|s| format!("{} {}", s.animal, s.name)).unwrap_or_else(|| "runeterm".into());
+            let (title, body) = match p.note.lock().unwrap().clone() {
+                Some((t, b)) if !t.is_empty() || !b.is_empty() => (if t.is_empty() { p.program.clone() } else { t }, b),
+                _ => (format!("{} needs you", p.program), String::new()),
+            };
+            let body = if body.is_empty() { format!("{session} · tab {tab}") } else { format!("{body}\n{session} · tab {tab}") };
+            send.push((*id, title, body));
+        }
+        for (id, title, body) in send {
+            self.notified.insert(id);
+            let _ = std::process::Command::new("notify-send")
+                .args(["--app-name=runeterm", "--icon=runeterm", &title, &body])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
         }
     }
 }
@@ -856,6 +1154,14 @@ mod tests {
     }
 
     #[test]
+    fn finds_urls_under_the_pointer() {
+        let l = "see https://ghostty.org/docs. or (http://a.b/c_(d)) now";
+        assert_eq!(url_at(l, 10).as_deref(), Some("https://ghostty.org/docs"));
+        assert_eq!(url_at(l, 40).as_deref(), Some("http://a.b/c_(d)"));
+        assert_eq!(url_at(l, 1), None);
+    }
+
+    #[test]
     fn editors_open_at_the_end() {
         let p = std::path::Path::new("/tmp/s.txt");
         let base = |c: Vec<String>| -> Vec<String> {
@@ -900,6 +1206,62 @@ fn editor_command(editor: &str, path: &std::path::Path, lines: usize) -> Vec<Str
         _ => words.push(file),
     }
     words
+}
+
+/// Settings that change how things behave rather than look.
+#[derive(Clone, Copy, Debug)]
+pub struct Behaviour {
+    /// `copy-on-select`: selecting also copies to the clipboard (middle-click pastes the
+    /// selection either way).
+    pub copy_on_select: bool,
+    /// `confirm-close`: ask before closing a split that's running something.
+    pub confirm_close: bool,
+    /// `notifications`: desktop notifications for splits that want attention out of sight.
+    pub notifications: bool,
+}
+
+impl Behaviour {
+    fn from(c: &Config) -> Behaviour {
+        Behaviour { copy_on_select: c.copy_on_select, confirm_close: c.confirm_close, notifications: c.notifications }
+    }
+}
+
+/// The URL around column `col` of a line, if there is one.
+pub fn url_at(line: &str, col: usize) -> Option<String> {
+    let chars: Vec<char> = line.chars().collect();
+    if col >= chars.len() {
+        return None;
+    }
+    let stop = |c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | '`' | '|');
+    let (mut a, mut b) = (col, col);
+    while a > 0 && !stop(chars[a - 1]) {
+        a -= 1;
+    }
+    while b < chars.len() && !stop(chars[b]) {
+        b += 1;
+    }
+    let word: String = chars[a..b].iter().collect();
+    let start = ["https://", "http://", "file://", "mailto:", "ftp://"].iter().filter_map(|p| word.find(p)).min()?;
+    // Trailing punctuation is the sentence's, not the URL's (a closing paren only when unopened).
+    let mut url = word[start..].to_string();
+    while let Some(last) = url.chars().last() {
+        let unbalanced = last == ')' && url.matches('(').count() < url.matches(')').count();
+        if matches!(last, '.' | ',' | ';' | ':' | '!' | '?' | ']' | '}') || unbalanced {
+            url.pop();
+        } else {
+            break;
+        }
+    }
+    (url.len() > 8).then_some(url)
+}
+
+/// Opens a link with the desktop's handler.
+pub fn open_link(url: &str) {
+    let _ = std::process::Command::new("xdg-open")
+        .arg(url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 }
 
 /// `$VISUAL`, `$EDITOR`, or the first of nvim, vim, hx, vi that's installed.

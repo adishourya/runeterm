@@ -27,6 +27,16 @@ pub struct Config {
     pub sidebar: Sidebar,
     /// `scrollback-editor`: what ⌥E opens a split's scrollback in.
     pub scrollback_editor: String,
+    /// `theme = light` uses `light_theme` (the `light-*` keys) for the terminals and a light UI.
+    pub light: bool,
+    pub light_theme: Theme,
+    /// `accent`: the focused split's light, selections, the active tab.
+    pub accent: Rgb,
+    /// `accent-colors`: the swatches the sidebar offers.
+    pub accents: Vec<Rgb>,
+    pub copy_on_select: bool,
+    pub confirm_close: bool,
+    pub notifications: bool,
 }
 
 /// The sidebar's settings.
@@ -86,6 +96,23 @@ impl Default for Config {
             shader_animation: ShaderAnimation::Focused,
             sidebar: Sidebar::default(),
             scrollback_editor: "auto".into(),
+            light: false,
+            light_theme: Theme {
+                fg: Rgb(0x1f, 0x23, 0x28),
+                bg: Rgb(0xfa, 0xfa, 0xf8),
+                cursor: Rgb(0x3b, 0x3f, 0x46),
+                ansi: [
+                    "#24292f", "#cf222e", "#116329", "#7d4e00", "#0550ae", "#8250df", "#1b7c83", "#6e7781",
+                    "#57606a", "#a40e26", "#1a7f37", "#9a6700", "#218bff", "#a475f9", "#3192aa", "#8c959f",
+                ]
+                .map(|h| rgb(h).unwrap()),
+                cursor_style: CursorStyle::Bar,
+            },
+            accent: Rgb(0x8a, 0xb4, 0xf8),
+            copy_on_select: false,
+            confirm_close: true,
+            notifications: true,
+            accents: ["#8ab4f8", "#a78bfa", "#ff7ab6", "#ff9f5a", "#ffd166", "#7ee081", "#4fd1c5"].map(|h| rgb(h).unwrap()).to_vec(),
         }
     }
 }
@@ -220,10 +247,26 @@ impl Config {
              # user@host under the session's name.\n\
              sidebar-host = {}\n\
              \n\
+             # --- Appearance ---\n\
+             # dark or light. The light terminal colours are light-background,\n\
+             # light-foreground, light-cursor-color and light-palette = N=#rrggbb.\n\
+             theme = {theme}\n\
+             # The focused split's light, selections and the active tab.\n\
+             accent = {accent}\n\
+             # The swatches the sidebar offers.\n\
+             accent-colors = {accents}\n\
+             \n\
              # --- Keys ---\n\
+             # Selecting with the mouse also copies to the clipboard (middle-click pastes\n\
+             # the selection either way).\n\
+             copy-on-select = {copy_on_select}\n\
+             # Ask before closing a split that's running something other than the shell.\n\
+             confirm-close = {confirm_close}\n\
+             # Desktop notifications for splits that want you while out of sight.\n\
+             notifications = {notifications}\n\
              # alt+e opens the focused split's scrollback in this editor. auto: $VISUAL,\n\
              # $EDITOR, or the first of nvim, vim, hx, vi that's installed.\n\
-             scrollback-editor = {}\n",
+             scrollback-editor = {editor}\n",
             f.family,
             f.size,
             f.padding,
@@ -237,7 +280,13 @@ impl Config {
             self.sidebar.clock,
             self.sidebar.battery,
             self.sidebar.host,
-            self.scrollback_editor,
+            editor = self.scrollback_editor,
+            copy_on_select = self.copy_on_select,
+            confirm_close = self.confirm_close,
+            notifications = self.notifications,
+            accent = hex(self.accent),
+            accents = self.accents.iter().map(|c| hex(*c)).collect::<Vec<_>>().join(", "),
+            theme = if self.light { "light" } else { "dark" },
             sidebar = if self.sidebar.pinned { "pinned" } else { "hover" },
         )
     }
@@ -303,6 +352,29 @@ impl Config {
                 "sidebar-battery" => self.sidebar.battery = v != "false",
                 "sidebar-host" => self.sidebar.host = v != "false",
                 "scrollback-editor" if !v.is_empty() => self.scrollback_editor = v.to_string(),
+                "theme" => self.light = v == "light",
+                "copy-on-select" => self.copy_on_select = matches!(v, "true" | "clipboard"),
+                "confirm-close" | "confirm-close-surface" => self.confirm_close = v != "false",
+                "notifications" | "desktop-notifications" => self.notifications = v != "false",
+                "accent" => self.accent = rgb(v).unwrap_or(self.accent),
+                "accent-colors" => {
+                    let list: Vec<Rgb> = v.split(',').filter_map(rgb).collect();
+                    if !list.is_empty() {
+                        self.accents = list;
+                    }
+                }
+                "light-background" => self.light_theme.bg = rgb(v).unwrap_or(self.light_theme.bg),
+                "light-foreground" => self.light_theme.fg = rgb(v).unwrap_or(self.light_theme.fg),
+                "light-cursor-color" => self.light_theme.cursor = rgb(v).unwrap_or(self.light_theme.cursor),
+                "light-palette" => {
+                    if let Some((i, c)) = v.split_once('=') {
+                        if let (Ok(i), Some(c)) = (i.trim().parse::<usize>(), rgb(c)) {
+                            if i < 16 {
+                                self.light_theme.ansi[i] = c;
+                            }
+                        }
+                    }
+                }
                 "cursor-style" => {
                     self.cursor_style = match v {
                         "block" => CursorStyle::Block,
@@ -315,7 +387,42 @@ impl Config {
             }
         }
         self.theme.cursor_style = self.cursor_style;
+        self.light_theme.cursor_style = self.cursor_style;
     }
+
+    /// The terminal colours in use: the light set under `theme = light`.
+    pub fn colors(&self) -> Theme {
+        if self.light { self.light_theme } else { self.theme }
+    }
+}
+
+/// Sets `key = value` in the config file: the first uncommented line with that key, or a new
+/// line at the end. For choices made in the UI (theme, accent), so they stick.
+pub fn set(key: &str, value: &str) -> std::io::Result<()> {
+    let path = path();
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut done = false;
+    let mut out: Vec<String> = text
+        .lines()
+        .map(|l| {
+            let t = l.trim_start();
+            let is_key = !t.starts_with('#') && t.split_once('=').is_some_and(|(k, _)| k.trim() == key);
+            if is_key && !done {
+                done = true;
+                format!("{key} = {value}")
+            } else {
+                l.to_string()
+            }
+        })
+        .collect();
+    if !done {
+        out.push(format!("{key} = {value}"));
+    }
+    std::fs::write(&path, out.join("\n") + "\n")
+}
+
+pub fn hex_of(c: Rgb) -> String {
+    hex(c)
 }
 
 /// A reloaded config for the renderer, which lives outside the app state.
@@ -363,6 +470,19 @@ mod tests {
     }
 
     #[test]
+    fn reads_appearance() {
+        let mut c = Config::default();
+        c.apply("theme = light\naccent = #ff0000\naccent-colors = #010203, #040506\nlight-background = #ffffff\nlight-palette = 1=#aa0000\n", Path::new("/"));
+        assert!(c.light);
+        assert_eq!(c.accent, Rgb(255, 0, 0));
+        assert_eq!(c.accents, vec![Rgb(1, 2, 3), Rgb(4, 5, 6)]);
+        assert_eq!(c.colors().bg, Rgb(255, 255, 255));
+        assert_eq!(c.colors().ansi[1], Rgb(0xaa, 0, 0));
+        c.apply("theme = dark\n", Path::new("/"));
+        assert_eq!(c.colors().bg, c.theme.bg);
+    }
+
+    #[test]
     fn line_height_takes_percent_or_pixels() {
         let mut c = Config::default();
         c.apply("line-height = 4\n", Path::new("/"));
@@ -386,5 +506,7 @@ mod tests {
         assert_eq!(back.cursor_opacity, 0.0);
         assert_eq!(back.shaders, vec![PathBuf::from("/cfg/shaders/a.glsl")]);
         assert_eq!(back.sidebar, c.sidebar);
+        assert_eq!((back.accent, back.accents.clone(), back.scrollback_editor.clone()), (c.accent, c.accents.clone(), c.scrollback_editor.clone()));
+        assert_eq!(back.light, c.light);
     }
 }
