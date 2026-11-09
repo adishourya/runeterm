@@ -1,3 +1,6 @@
+mod accents;
+mod anim;
+mod animals;
 mod bench;
 mod config;
 mod grid;

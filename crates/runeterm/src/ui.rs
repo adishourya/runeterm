@@ -187,14 +187,20 @@ fn pane(s: &State, tab: &Tab, id: u32) -> El {
             .shadow(14.0, 44.0, look::shade(0.55))
             .child(
                 el().key(format!("glow-{id}")).absolute(0.0, 0.0).w_full().h(40.0)
-                    .radial_gradient(
-                        [0.5, 0.0],
-                        [720.0, 46.0],
-                        [
-                            (0.0, tint.alpha(if focused { 0.2 } else { 0.12 })),
-                            (0.6, tint.alpha(if focused { 0.07 } else { 0.04 })),
-                            (1.0, tint.alpha(0.0)),
-                        ],
+                    // Left to right across the ribbon, strongest in the middle and thinning out
+                    // towards both ends.
+                    .linear_gradient(
+                        std::f32::consts::FRAC_PI_2,
+                        {
+                            let peak = if focused { 0.17 } else { 0.1 };
+                            [
+                                (0.0, tint.alpha(0.0)),
+                                (0.2, tint.alpha(peak * 0.45)),
+                                (0.5, tint.alpha(peak)),
+                                (0.8, tint.alpha(peak * 0.45)),
+                                (1.0, tint.alpha(0.0)),
+                            ]
+                        },
                     )
                     .cycle(BREATHE)
                     .transition(Transition::opacity()),
@@ -220,7 +226,7 @@ fn pane(s: &State, tab: &Tab, id: u32) -> El {
             s.mouse_moved(id, p.x, p.y, mods)
         })
         .on_wheel(move |s: &mut State, w, _| {
-            s.wheel(id, w.x, w.y, w.dy, w.mods);
+            s.wheel(id, w.x, w.y, w.dy, w.precise, w.mods);
             true
         });
     card = card.child(header).child(grid);
@@ -389,7 +395,7 @@ fn session_hue(_: &State) -> Color {
 fn badge(s: &State, size: f32) -> El {
     let c = session_hue(s);
     let face = match &s.session {
-        Some(sess) if !sess.animal.is_empty() => text(sess.animal.clone()).font(TextStyle::new(size * 0.54, 400.0)),
+        Some(sess) if !sess.animal.is_empty() => animal(&sess.animal, size * 0.8, size * 0.54, hovered(s, &sess.animal)),
         _ => icon(&icons::TERMINAL, size * 0.46).color(c),
     };
     el().key("session-badge").size(size, size).radius(size * 0.32).center()
@@ -402,7 +408,39 @@ fn badge(s: &State, size: f32) -> El {
         .help("Sessions · right-click for the emoji")
         .on_press(|s: &mut State| s.toggle_picker())
         .on_secondary_press(|s: &mut State, _, _: &mut Tx| s.choose_own_emoji())
+        .on_hover_change(plays_on_hover(s.session.as_ref().map(|x| x.animal.clone()).unwrap_or_default()))
         .child(face)
+}
+
+/// A session's animal: its animation's first frame, playing while `playing` (hovered), or its
+/// emoji when there's no animation of it.
+fn animal(emoji: &str, size: f32, font: f32, playing: bool) -> El {
+    match crate::anim::find(emoji) {
+        Some(a) if playing => {
+            // Keyed by the frame, so Rune draws the element anew.
+            let (px, i) = crate::anim::frame(a);
+            el().key(format!("anim-{}-{i}", a.name)).size(size, size).pixels(&px)
+        }
+        Some(a) => el().size(size, size).pixels(&crate::anim::still(a)),
+        None => text(emoji.to_string()).font(TextStyle::new(font, 400.0)),
+    }
+}
+
+/// Plays `emoji`'s animal while the pointer is over the element.
+fn plays_on_hover(emoji: String) -> impl Fn(&mut State, bool, &mut Tx) + 'static {
+    move |s, inside, tx| {
+        if inside {
+            s.hovered_animal = Some(emoji.clone());
+        } else if s.hovered_animal.as_ref() == Some(&emoji) {
+            s.hovered_animal = None;
+        }
+        // Start ticking now.
+        tx.wake_after(std::time::Duration::ZERO);
+    }
+}
+
+fn hovered(s: &State, emoji: &str) -> bool {
+    s.hovered_animal.as_deref() == Some(emoji)
 }
 
 fn session_name(s: &State) -> String {
@@ -638,7 +676,7 @@ fn sidebar(s: &State) -> El {
 /// session's emoji, or kill one.
 fn picker(s: &State, sessions: &[crate::spooky::SessionInfo]) -> El {
     let body = match &s.picker_mode {
-        PickerMode::Emoji { session, animals } => emoji_grid(sessions, session, animals),
+        PickerMode::Emoji { session, animals } => emoji_grid(s, sessions, session, animals),
         mode => session_list(s, sessions, mode),
     };
     let panel = col().key("picker").absolute(s.sidebar.width + 8.0, 12.0).w(356.0).max_h(600.0).p_all(8.0).gap(4.0).radius(16.0)
@@ -689,7 +727,8 @@ fn session_list(s: &State, sessions: &[crate::spooky::SessionInfo], mode: &Picke
             .hover(look::ink(0.08)).hover_alone().cursor(Cursor::Pointer)
             .help("Change emoji")
             .on_press(move |s: &mut State| s.choose_emoji(&emoji))
-            .child(text(info.animal.clone()).font(TextStyle::new(19.0, 400.0)));
+            .on_hover_change(plays_on_hover(info.animal.clone()))
+            .child(animal(&info.animal, 30.0, 19.0, hovered(s, &info.animal)));
         let trash = el().key(format!("picker-kill-{}", info.name)).size(28.0, 28.0).radius(8.0).center()
             .hover(look::attention().alpha(0.16)).cursor(Cursor::Pointer)
             .help("Kill session")
@@ -740,7 +779,7 @@ fn confirm_kill(info: &crate::spooky::SessionInfo, panes: &str) -> El {
 }
 
 /// Every emoji spooky offers, in two sections; the session's current one is ringed.
-fn emoji_grid(sessions: &[crate::spooky::SessionInfo], session: &str, animals: &[(String, String)]) -> El {
+fn emoji_grid(s: &State, sessions: &[crate::spooky::SessionInfo], session: &str, animals: &[(String, String)]) -> El {
     let current = sessions.iter().find(|i| i.name == session).map(|i| i.animal.clone()).unwrap_or_default();
     let split = animals.iter().position(|(_, n)| n == "soccer").unwrap_or(animals.len());
     let section = |title: &str, items: &[(String, String)]| {
@@ -752,7 +791,8 @@ fn emoji_grid(sessions: &[crate::spooky::SessionInfo], session: &str, animals: &
                 .hover(look::ink(0.08)).press(look::ink(0.12)).cursor(Cursor::Pointer)
                 .help(name.clone())
                 .on_press(move |s: &mut State| s.set_emoji(&session, &name))
-                .child(text(glyph.clone()).font(TextStyle::new(22.0, 400.0)));
+                .on_hover_change(plays_on_hover(glyph.clone()))
+                .child(animal(glyph, 34.0, 22.0, hovered(s, glyph)));
             if chosen {
                 cell = cell.fill(look::busy().alpha(0.14)).border(1.5, look::busy().alpha(0.7));
             }
@@ -769,7 +809,7 @@ fn emoji_grid(sessions: &[crate::spooky::SessionInfo], session: &str, animals: &
     let mut c = col().w_full().gap(10.0).p_all(2.0)
         .child(row().h(32.0).gap(8.0).items_center()
             .child(back)
-            .child(text(current.clone()).font(TextStyle::new(18.0, 400.0)))
+            .child(animal(&current, 26.0, 18.0, hovered(s, &current)))
             .child(text(format!("Emoji for {session}")).font(TITLE).color(look::text()).single_line().truncate()));
     if animals.is_empty() {
         return c.child(text("spooky didn't list any emoji").font(SMALL).color(look::faint()).px(4.0));
@@ -871,15 +911,30 @@ pub fn spec() -> AppSpec<State> {
             let _ = WAKER.set(waker);
         }),
         poll: Some(|s, t, tx: &mut Tx| {
-            // The clock and battery change on their own: look again every few seconds.
-            tx.wake_after(std::time::Duration::from_secs(5));
-            s.poll(t)
+            let changed = s.poll(t);
+            // The clock and battery change on their own: look again every few seconds, or at
+            // the next frame of an animal on screen.
+            let (moved, next) = crate::anim::tick(t, &s.animals_on_screen());
+            tx.wake_after(std::time::Duration::from_secs_f64(next.unwrap_or(5.0).clamp(1.0 / 120.0, 5.0)));
+            changed || moved
         }),
         on_key: Some(|s, e, tx: &mut Tx| s.key(e, tx)),
         scenes: &[
             ("demo", demo),
             ("sidebar", |s| s.sidebar_open = true),
             ("pinned", |s| s.sidebar.pinned = true),
+            ("scrollback", |s| {
+                // A screenful and more of output, to scroll back through.
+                if let Some(p) = s.focused_id().and_then(|id| s.panes.get(&id)) {
+                    p.send(b"seq 1 300\n");
+                }
+            }),
+            ("animal", |s| {
+                // A session with an animated animal (by name: no daemon in headless runs).
+                s.session = Some(crate::state::Session { name: "headless-cat".into(), animal: "cat".into() });
+                s.sidebar.pinned = true;
+                s.split(Dir::Right);
+            }),
             ("picker", |s| s.toggle_picker()),
             ("confirm-kill", |s| {
                 s.toggle_picker();

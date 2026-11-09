@@ -69,7 +69,7 @@ pub enum ShaderAnimation {
     Always,
 }
 
-fn rgb(s: &str) -> Option<Rgb> {
+pub fn rgb(s: &str) -> Option<Rgb> {
     let s = s.trim().trim_start_matches('#');
     let v = u32::from_str_radix(s, 16).ok()?;
     (s.len() == 6).then(|| Rgb((v >> 16) as u8, (v >> 8) as u8, v as u8))

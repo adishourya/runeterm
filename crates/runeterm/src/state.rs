@@ -92,10 +92,21 @@ pub struct State {
     pub settings: Behaviour,
     /// Appearance: light mode, the accent, and the accents to choose from.
     pub light: bool,
+    /// The accent shown: this session's own, or `default_accent` outside a session.
     pub accent: crate::vt::Rgb,
+    /// The config's accent.
+    pub default_accent: crate::vt::Rgb,
     pub accents: Vec<crate::vt::Rgb>,
+    /// The session `accent` was looked up for.
+    accent_for: Option<String>,
     /// The spooky session this window is, once the daemon has named it.
     pub session: Option<Session>,
+    /// The animal under the pointer: the only one that plays.
+    pub hovered_animal: Option<String>,
+    /// The session whose emoji was last checked for an animation (see `give_mascot`).
+    mascot_checked: Option<String>,
+    /// Wheel movement not yet a whole line, by pane, in lines.
+    wheel_rest: HashMap<u32, f32>,
     /// Whether the window has keyboard focus (for the cursor and shaders' `iFocus`).
     pub window_focused: bool,
     /// The sidebar is expanded (hovered, or the session picker is open).
@@ -175,8 +186,13 @@ impl State {
             settings: Behaviour::from(config),
             light: config.light,
             accent: config.accent,
+            default_accent: config.accent,
             accents: config.accents.clone(),
+            accent_for: None,
             session: None,
+            hovered_animal: None,
+            mascot_checked: None,
+            wheel_rest: HashMap::new(),
             window_focused: true,
             sidebar_open: false,
             sidebar: config.sidebar,
@@ -338,6 +354,7 @@ impl State {
     /// Drops a split from the window without ending its pane (it ended, or another window
     /// took it).
     fn forget(&mut self, id: u32) {
+        self.wheel_rest.remove(&id);
         if let (Some(g), Some(p)) = (self.gestures.remove(&id), self.panes.get(&id)) {
             g.free(&p.term.lock().unwrap());
         }
@@ -433,6 +450,8 @@ impl State {
     pub fn poll(&mut self, t: f64) -> bool {
         let mut changed = false;
         changed |= self.handle_events();
+        changed |= self.follow_session_accent();
+        self.give_mascot();
         let exited: Vec<u32> = self.panes.values().filter(|p| p.exited.load(Ordering::Acquire)).map(|p| p.id).collect();
         for id in exited {
             self.forget(id);
@@ -563,6 +582,47 @@ impl State {
         changed
     }
 
+    /// A session whose emoji doesn't animate (a sport, or an animal without an animation) gets
+    /// an animated mascot instead, one no other session has if there's one left. Once per
+    /// session; the daemon then reports the new emoji.
+    fn give_mascot(&mut self) {
+        let Some(sess) = &self.session else { return };
+        if sess.animal.is_empty() || self.mascot_checked.as_ref() == Some(&sess.name) {
+            return;
+        }
+        self.mascot_checked = Some(sess.name.clone());
+        if crate::anim::find(&sess.animal).is_some() || self.controller.is_none() {
+            return;
+        }
+        let taken: Vec<&'static str> =
+            spooky::sessions().iter().filter_map(|i| crate::anim::find(&i.animal)).map(|a| a.name).collect();
+        let all = crate::animals::ALL;
+        let Some(pick) = all.iter().find(|a| !taken.contains(&a.name)).or(all.first()) else { return };
+        if let Err(e) = spooky::set_animal(&sess.name, pick.name) {
+            eprintln!("runeterm: can't give {} a mascot: {e}", sess.name);
+        }
+    }
+
+    /// The animals to play: only the one under the pointer.
+    pub fn animals_on_screen(&self) -> Vec<&'static crate::animals::Anim> {
+        self.hovered_animal.as_deref().and_then(crate::anim::find).into_iter().collect()
+    }
+
+    /// Takes the session's own accent once the session is known (a new one is given a colour no
+    /// other session has), and the config's outside a session.
+    fn follow_session_accent(&mut self) -> bool {
+        let name = self.session.as_ref().map(|s| s.name.clone());
+        if name == self.accent_for {
+            return false;
+        }
+        self.accent = match &name {
+            Some(n) => crate::accents::of(n, &self.accents, self.default_accent),
+            None => self.default_accent,
+        };
+        self.accent_for = name;
+        true
+    }
+
     /// Starts a new session in this window; the current one stays in spooky, detached.
     pub fn new_session(&mut self) {
         self.picker = None;
@@ -640,6 +700,13 @@ impl State {
     }
 
     pub fn set_accent(&mut self, c: crate::vt::Rgb) {
+        if let Some(s) = &self.session {
+            // In a session the swatches colour the session; the config's accent is for windows
+            // outside one.
+            crate::accents::set(&s.name, c);
+            self.accent = c;
+            return;
+        }
         if let Err(e) = crate::config::set("accent", &crate::config::hex_of(c)) {
             eprintln!("runeterm: can't save the accent: {e}");
         }
@@ -703,8 +770,10 @@ impl State {
         self.scrollback_editor = c.scrollback_editor.clone();
         self.theme = c.colors();
         self.light = c.light;
-        self.accent = c.accent;
+        self.default_accent = c.accent;
         self.accents = c.accents.clone();
+        self.accent_for = None;
+        self.follow_session_accent();
         for p in self.panes.values() {
             let mut t = p.term.lock().unwrap();
             t.set_colors(self.theme.fg, self.theme.bg, self.theme.cursor, &self.theme.ansi);
@@ -733,7 +802,9 @@ impl State {
 
     /// Shows the emoji grid for `session`.
     pub fn choose_emoji(&mut self, session: &str) {
-        self.picker_mode = PickerMode::Emoji { session: session.to_string(), animals: spooky::animals() };
+        // Only the mascots that animate.
+        let animals = spooky::animals().into_iter().filter(|(glyph, _)| crate::anim::find(glyph).is_some()).collect();
+        self.picker_mode = PickerMode::Emoji { session: session.to_string(), animals };
     }
 
     pub fn set_emoji(&mut self, session: &str, animal: &str) {
@@ -760,6 +831,8 @@ impl State {
         }
         if let Err(e) = spooky::remove(session) {
             eprintln!("runeterm: can't kill session {session}: {e}");
+        } else {
+            crate::accents::remove(session);
         }
         if here {
             self.new_tab(None);
@@ -1031,12 +1104,24 @@ impl State {
     }
 
     /// The wheel: to the program when it tracks the mouse, else through the scrollback.
-    pub fn wheel(&mut self, id: u32, x: f32, y: f32, dy: f32, mods: rune::Mods) {
+    pub fn wheel(&mut self, id: u32, x: f32, y: f32, dy: f32, precise: bool, mods: rune::Mods) {
         let Some(pane) = self.panes.get(&id) else { return };
-        let rows = (-dy / 20.0).round() as isize;
+        // A trackpad sends many small deltas: keep the part short of a whole line for the next
+        // one, instead of rounding each away.
+        let line = crate::grid::geometry(id).map_or(20.0, |g| g.cell_h / g.scale).max(1.0);
+        // A notch of a mouse wheel (Rune's 40 points) is three lines, as in most terminals.
+        let lines = if precise { -dy / line } else { -dy / 40.0 * 3.0 };
+        let rest = self.wheel_rest.entry(id).or_insert(0.0);
+        // Turning back drops what was left of the other way.
+        if *rest * lines < 0.0 {
+            *rest = 0.0;
+        }
+        *rest += lines;
+        let rows = rest.trunc() as isize;
         if rows == 0 {
             return;
         }
+        *rest -= rows as f32;
         let tracking = pane.term.lock().unwrap().mouse_tracking();
         if tracking && !mods.shift {
             let Some(at) = self.pointer_at(id, x, y) else { return };

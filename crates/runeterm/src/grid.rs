@@ -1127,6 +1127,8 @@ impl Compositor<State> for GridRenderer {
 
         let (device, queue) = (f.device, f.queue);
         let state = &f.rt.state;
+        // Selections take the session's accent.
+        self.accent = state.accent;
         let focused = state.focused_id();
         let shaders = self.gpu.as_ref().is_some_and(|g| g.chain.is_some());
 

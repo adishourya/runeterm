@@ -11,6 +11,10 @@ owns every pty, so splits and tabs outlive the window and come back after a rebo
 - Ghostty-compatible custom shaders (`custom-shader`), including cursor shaders.
 - A sidebar of tabs and their splits, a session picker (new, restore, change emoji, kill),
   minimized splits as floating pills.
+- Each session has its own accent (picked so no two sessions share one, kept in
+  `~/.local/state/runeterm/accents`) and, for most animals, a little animation (played when
+  you hover it) instead of the emoji: Lottie animations from LottieFiles, pre-rendered into `assets/animations/` (sources
+  and licence in `assets/animations/SOURCES.md`).
 
 ## Build
 
