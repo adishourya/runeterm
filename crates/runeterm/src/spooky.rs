@@ -212,8 +212,52 @@ pub fn sessions() -> Vec<SessionInfo> {
     request(tag::LIST, b"").map(|t| parse_sessions(&t)).unwrap_or_default()
 }
 
-/// Every emoji a session can have, as (glyph, name), in spooky's order: animals, then sports.
+/// The animal emojis a session can have, as (glyph, name), in spooky's order (not the sports).
 pub fn animals() -> Vec<(String, String)> {
+    let mono = mono_coverage();
+    all_emoji()
+        .into_iter()
+        .take_while(|(_, name)| name != "soccer")
+        .filter(|(glyph, _)| in_colour(glyph, mono))
+        .collect()
+}
+
+/// What fonts without colour glyphs cover, as codepoint ranges, from fontconfig, looked up
+/// once. An emoji one of them covers may be drawn from it, in black and white (DejaVu Sans
+/// has a cat and a monkey face, for one).
+fn mono_coverage() -> &'static [(u32, u32)] {
+    static RANGES: std::sync::OnceLock<Vec<(u32, u32)>> = std::sync::OnceLock::new();
+    RANGES.get_or_init(|| {
+        let Ok(out) = std::process::Command::new("fc-list").args(["--format", "%{color}|%{charset}\n"]).output() else {
+            return vec![];
+        };
+        parse_mono(&String::from_utf8_lossy(&out.stdout))
+    })
+}
+
+fn parse_mono(text: &str) -> Vec<(u32, u32)> {
+    text.lines()
+        .filter_map(|l| l.strip_prefix("False|"))
+        .flat_map(|cs| cs.split_whitespace())
+        .filter_map(|r| {
+            let (a, b) = r.split_once('-').unwrap_or((r, r));
+            Some((u32::from_str_radix(a, 16).ok()?, u32::from_str_radix(b, 16).ok()?))
+        })
+        .collect()
+}
+
+/// Whether `glyph` can only come from a colour font: no colourless font covers it (the
+/// variation selector and joiner aside).
+fn in_colour(glyph: &str, mono: &[(u32, u32)]) -> bool {
+    glyph
+        .chars()
+        .map(|c| c as u32)
+        .filter(|&c| c != 0xfe0f && c != 0x200d)
+        .all(|c| !mono.iter().any(|&(a, b)| a <= c && c <= b))
+}
+
+/// Every emoji spooky offers, animals then sports.
+fn all_emoji() -> Vec<(String, String)> {
     let Ok(out) = std::process::Command::new(binary()).args(["animal", "--list"]).output() else { return vec![] };
     parse_animals(&String::from_utf8_lossy(&out.stdout))
 }
@@ -433,6 +477,16 @@ impl Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn animals_a_colourless_font_covers_are_left_out() {
+        let mono = parse_mono("False|20-7e 1f431 1f435-1f436\nTrue|20 1f431-1f43e\n");
+        assert_eq!(mono, vec![(0x20, 0x7e), (0x1f431, 0x1f431), (0x1f435, 0x1f436)]);
+        assert!(!in_colour("🐱", &mono));
+        assert!(!in_colour("🐶", &mono));
+        assert!(in_colour("🦊", &mono));
+        assert!(in_colour("🐼\u{fe0f}", &mono));
+    }
 
     #[test]
     fn frames_round_trip_in_pieces() {
