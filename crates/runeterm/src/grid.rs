@@ -1005,16 +1005,16 @@ impl GridRenderer {
         let p = self.panes.get(&id).unwrap();
         let off = p.offscreen.as_ref().unwrap();
 
-        // The grid, upside down (Shadertoy's y points up), on the terminal's background as
-        // Ghostty gives it to shaders, but at 0.8 alpha: effect shaders see the real colour,
-        // and cursor shaders can still tell text (alpha 1) from background.
+        // The grid, upside down (Shadertoy's y points up), on the terminal's background colour
+        // at zero alpha: effect shaders sampling it see the real colour (not black), cursor
+        // shaders can tell text (alpha 1) from background, and what a shader leaves untouched
+        // stays clear, so the split's own light shows through it.
         let lin = |v: u8| {
             let c = v as f64 / 255.0;
             if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
         };
-        const BG_ALPHA: f64 = 0.8;
         let b = self.theme.bg;
-        let bg_clear = wgpu::Color { r: lin(b.0) * BG_ALPHA, g: lin(b.1) * BG_ALPHA, b: lin(b.2) * BG_ALPHA, a: BG_ALPHA };
+        let bg_clear = wgpu::Color { r: lin(b.0), g: lin(b.1), b: lin(b.2), a: 0.0 };
         let u = Uniforms {
             origin: [0.0; 4],
             target: [size.0 as f32, size.1 as f32, 0.0, 0.0],

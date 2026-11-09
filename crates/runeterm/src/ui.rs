@@ -76,7 +76,7 @@ const SMALL: TextStyle = TextStyle::new(11.5, 450.0);
 const CAPS: TextStyle = TextStyle::new(10.0, 650.0);
 
 /// The focused split's glow breathes; an attention dot pulses.
-const BREATHE: Cycle = Cycle { period: 7.0, phase: 0.0, stops: &[(0.0, 0.55), (0.5, 1.0), (1.0, 0.55)], still: 0.8, fps: 30.0 };
+const BREATHE: Cycle = Cycle { period: 7.0, phase: 0.0, stops: &[(0.0, 0.78), (0.5, 1.0), (1.0, 0.78)], still: 0.9, fps: 30.0 };
 const PULSE: Cycle = Cycle { period: 1.4, phase: 0.0, stops: &[(0.0, 1.0), (0.5, 0.35), (1.0, 1.0)], still: 1.0, fps: 30.0 };
 
 fn pane_bg(s: &State) -> Color {
@@ -95,6 +95,22 @@ fn logo(program: &str, size: f32, attention: bool) -> El {
 fn dot(c: Color, pulse: bool) -> El {
     let d = el().size(7.0, 7.0).radius(3.5).fill(c).shadow(0.0, 8.0, c.alpha(0.55));
     if pulse { d.cycle(PULSE) } else { d }
+}
+
+/// While a split is full screen, its zoom button is a glowing circle in the accent; clicking
+/// it (or ⌥Z) brings the other splits back.
+fn zoomed_button(id: u32) -> El {
+    let c = look::accent();
+    el().key(format!("zoom-{id}")).size(26.0, 26.0).radius(13.0).center()
+        .fill(c.alpha(0.9))
+        .border(1.0, c)
+        .shadow(0.0, 14.0, c.alpha(0.55))
+        .hover(look::ink(0.12)).press(look::ink(0.2)).cursor(Cursor::Pointer)
+        .transition(Transition::scale(0.6).combined(Transition::opacity()))
+        .cycle(BREATHE)
+        .help("Exit full screen  ⌥Z".to_string())
+        .on_press(move |s: &mut State| s.toggle_zoom(id))
+        .child(icon(&icons::COLLAPSE, 13.0).color(hex("#0b0b0d").unwrap()))
 }
 
 fn tool(key: String, i: &'static Icon, help: &str, f: impl Fn(&mut State) + 'static) -> El {
@@ -136,7 +152,11 @@ fn pane(s: &State, tab: &Tab, id: u32) -> El {
     if !only {
         tools = tools
             .child(tool(format!("min-{id}"), &icons::MINIMIZE, "Minimize  ⌥M", move |s: &mut State| s.minimize(id)))
-            .child(tool(format!("zoom-{id}"), if tab.zoomed { &icons::COLLAPSE } else { &icons::EXPAND }, "Zoom  ⌥↩", move |s: &mut State| s.toggle_zoom(id)));
+            .child(if tab.zoomed {
+                zoomed_button(id)
+            } else {
+                tool(format!("zoom-{id}"), &icons::EXPAND, "Full screen  ⌥Z", move |s: &mut State| s.toggle_zoom(id))
+            });
     }
     tools = tools.child(tool(format!("close-{id}"), &icons::CLOSE, "Close  ⌥X", move |s: &mut State| s.request_close(id)));
     let tools = if focused { tools } else { tools.group_opacity(0.0, 1.0) };
@@ -160,20 +180,29 @@ fn pane(s: &State, tab: &Tab, id: u32) -> El {
         // Taken here so a drag on the header doesn't move the dividers around it.
         .on_drag(|_: &mut State, _: &mut Drag, _: &mut Tx| {});
     if focused || attention {
-        // A soft light from the top of the card, tinted by the program, slowly breathing.
+        // A light in the accent across the header strip only (it never reaches the terminal),
+        // slowly breathing.
         card = card
             .shadow(1.0, 3.0, look::shade(0.45))
             .shadow(14.0, 44.0, look::shade(0.55))
             .child(
-                el().key(format!("glow-{id}")).absolute(0.0, 0.0).w_full().h(220.0)
-                    .radial_gradient([0.5, 0.0], [620.0, 220.0], [(0.0, tint.alpha(if focused { 0.13 } else { 0.09 })), (1.0, tint.alpha(0.0))])
+                el().key(format!("glow-{id}")).absolute(0.0, 0.0).w_full().h(40.0)
+                    .radial_gradient(
+                        [0.5, 0.0],
+                        [720.0, 46.0],
+                        [
+                            (0.0, tint.alpha(if focused { 0.2 } else { 0.12 })),
+                            (0.6, tint.alpha(if focused { 0.07 } else { 0.04 })),
+                            (1.0, tint.alpha(0.0)),
+                        ],
+                    )
                     .cycle(BREATHE)
                     .transition(Transition::opacity()),
             )
             .child(
                 // A hairline of the same light along the top edge.
                 el().key(format!("rim-{id}")).absolute(0.0, 0.0).w_full().h(1.0)
-                    .linear_gradient(std::f32::consts::FRAC_PI_2, [(0.0, tint.alpha(0.0)), (0.5, tint.alpha(0.45)), (1.0, tint.alpha(0.0))])
+                    .linear_gradient(std::f32::consts::FRAC_PI_2, [(0.0, tint.alpha(0.0)), (0.5, tint.alpha(0.75)), (1.0, tint.alpha(0.0))])
                     .cycle(BREATHE)
                     .transition(Transition::opacity()),
             );
@@ -323,7 +352,9 @@ fn tab_group(s: &State, i: usize, tab: &Tab) -> El {
         .child(head)
         .child(tree);
     if active {
-        g = g.fill(look::ink(0.03)).border(1.0, look::ink(0.04));
+        let accent = look::accent();
+        g = g.fill(look::ink(0.03)).gradient(accent.alpha(0.07), accent.alpha(0.0)).border(1.0, accent.alpha(0.16))
+            .shadow(4.0, 18.0, accent.alpha(0.08));
     } else {
         g = g.hover(look::ink(0.02));
     }
@@ -347,12 +378,10 @@ impl PadAll for El {
     }
 }
 
-/// Each session's own colour, picked from its emoji so a session keeps it everywhere.
-fn session_hue(s: &State) -> Color {
-    const HUES: [&str; 10] = ["#ff9f5a", "#ffd166", "#7ee081", "#5cc8ff", "#a78bfa", "#ff7ab6", "#4fd1c5", "#ff6b6b", "#c3e88d", "#82aaff"];
-    let key = s.session.as_ref().map(|x| if x.animal.is_empty() { x.name.clone() } else { x.animal.clone() }).unwrap_or_default();
-    let h = key.bytes().fold(2166136261u32, |h, b| (h ^ b as u32).wrapping_mul(16777619));
-    hex(HUES[(h % HUES.len() as u32) as usize]).unwrap()
+/// The session's colour: the accent, so the badge, the selected tab and the focused split
+/// glow alike.
+fn session_hue(_: &State) -> Color {
+    look::accent()
 }
 
 /// The session's badge: its emoji on a glowing tile of the session's colour. It opens the
@@ -431,9 +460,14 @@ fn rail(s: &State) -> El {
     for (i, tab) in s.tabs.iter().enumerate() {
         let active = i == s.active;
         let attention = tab.panes().iter().any(|id| s.needs_attention(*id));
+        let accent = look::accent();
         let mut tile = el().key(format!("rail-tab-{i}")).size(42.0, 42.0).radius(13.0).center()
-            .fill(if active { look::ink(0.1) } else { look::ink(0.035) })
-            .border(1.0, if active { look::ink(0.1) } else { Color::TRANSPARENT })
+            .fill(if active { look::ink(0.08) } else { look::ink(0.035) })
+            .when(active, |t| {
+                t.radial_gradient([0.5, 0.0], [46.0, 46.0], [(0.0, accent.alpha(0.22)), (1.0, accent.alpha(0.03))])
+                    .border(1.0, accent.alpha(0.3))
+                    .shadow(4.0, 14.0, accent.alpha(0.16))
+            })
             .hover(look::ink(0.06)).cursor(Cursor::Pointer)
             .on_press(move |s: &mut State| s.select_tab(i))
             .child(text(format!("{}", i + 1)).font(TextStyle::new(14.0, 650.0)).color(if active { look::text() } else { look::dim() }));
@@ -545,28 +579,39 @@ fn mode_switch(s: &State) -> El {
     row().p_all(2.0).gap(2.0).radius(10.0).fill(look::ink(0.05)).child(half(false)).child(half(true))
 }
 
-/// The bottom of the open sidebar: accent swatches and light or dark.
+/// The bottom of the open sidebar: light or dark, and (opened by clicking the row) the
+/// accent swatches.
 fn appearance(s: &State) -> El {
-    let mut swatches = row().gap(6.0).items_center().grow(1.0).flex_wrap();
-    for &c in &s.accents {
-        let on = c == s.accent;
-        let color = rgb_color(c);
-        swatches = swatches.child(
-            el().key(format!("accent-{}", crate::config::hex_of(c))).size(18.0, 18.0).radius(9.0).center()
-                .fill(color)
-                .border(2.0, if on { look::text() } else { Color::TRANSPARENT })
-                .shadow(0.0, if on { 10.0 } else { 0.0 }, color.alpha(0.6))
-                .cursor(Cursor::Pointer)
-                .help(crate::config::hex_of(c))
-                .on_press(move |s: &mut State| s.set_accent(c)),
-        );
+    let open = s.appearance_open;
+    let head = row().key("appearance-head").h(30.0).gap(8.0).items_center().cursor(Cursor::Pointer)
+        .on_press(|s: &mut State| s.appearance_open = !s.appearance_open)
+        .child(el().size(10.0, 10.0).radius(5.0).fill(look::accent()).shadow(0.0, 8.0, look::accent().alpha(0.6)))
+        .child(text("APPEARANCE").font(CAPS).color(look::faint()))
+        .child(icon(&icons::CHEVRON, 12.0).color(look::faint()).icon_rotation(if open { std::f32::consts::PI } else { 0.0 }))
+        .child(el().grow(1.0))
+        .child(mode_switch(s));
+    let mut c = col().key("appearance").w_full().gap(8.0).px(10.0).py(6.0).radius(14.0)
+        .fill(look::ink(0.03)).border(1.0, look::ink(0.04))
+        .child(head);
+    if open {
+        let mut swatches = row().key("swatches").gap(7.0).items_center().w_full().flex_wrap().pb(4.0)
+            .transition(Transition::offset(0.0, 6.0).combined(Transition::opacity()));
+        for &col in &s.accents {
+            let on = col == s.accent;
+            let color = rgb_color(col);
+            swatches = swatches.child(
+                el().key(format!("accent-{}", crate::config::hex_of(col))).size(20.0, 20.0).radius(10.0).center()
+                    .fill(color)
+                    .border(2.0, if on { look::text() } else { Color::TRANSPARENT })
+                    .shadow(0.0, if on { 12.0 } else { 0.0 }, color.alpha(0.6))
+                    .hover(look::ink(0.15)).cursor(Cursor::Pointer)
+                    .help(crate::config::hex_of(col))
+                    .on_press(move |s: &mut State| s.set_accent(col)),
+            );
+        }
+        c = c.child(swatches);
     }
-    col().key("appearance").w_full().gap(8.0).p_all(10.0).radius(14.0).fill(look::ink(0.03)).border(1.0, look::ink(0.04))
-        .child(row().items_center()
-            .child(text("APPEARANCE").font(CAPS).color(look::faint()))
-            .child(el().grow(1.0))
-            .child(mode_switch(s)))
-        .child(swatches)
+    c
 }
 
 /// The sidebar. Pinned, it's always open and the splits make room. Otherwise it's a rail

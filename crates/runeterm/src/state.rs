@@ -83,6 +83,8 @@ pub struct State {
     gestures: HashMap<u32, vt::Gesture>,
     mouse: vt::MouseEncoder,
     primary: String,
+    /// The sidebar's appearance section shows its swatches.
+    pub appearance_open: bool,
     /// A split asked to close while running something, waiting for a yes.
     pub confirm_close: Option<u32>,
     /// Panes a desktop notification went out for, until they're seen.
@@ -168,6 +170,7 @@ impl State {
             mouse: vt::MouseEncoder::default(),
             primary: String::new(),
             confirm_close: None,
+            appearance_open: false,
             notified: Default::default(),
             settings: Behaviour::from(config),
             light: config.light,
@@ -836,7 +839,7 @@ impl State {
                     tab.root.resize(tab.focused, side, 0.04);
                     true
                 }
-                Some('\n') => { let id = self.tabs[self.active].focused; self.toggle_zoom(id); true }
+                Some('\n' | 'z') => { let id = self.tabs[self.active].focused; self.toggle_zoom(id); true }
                 Some('x') => { let id = self.tabs[self.active].focused; self.request_close(id); true }
                 Some('m') => { let id = self.tabs[self.active].focused; self.minimize(id); true }
                 Some('r') => { self.reload_config(); true }
