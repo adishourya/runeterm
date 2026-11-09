@@ -9,12 +9,29 @@ owns every pty, so splits and tabs outlive the window and come back after a rebo
   its own wgpu pipeline, clipped to the surface's corners.
 - Kitty graphics, box drawing drawn to the cell, colour emoji and font fallback.
 - Ghostty-compatible custom shaders (`custom-shader`), including cursor shaders.
-- A sidebar of tabs and their splits, a session picker (new, restore, change emoji, kill),
+- A sidebar of tabs and their splits, a session picker (new, restore, change mascot, kill),
   minimized splits as floating pills.
 - Each session has its own accent (picked so no two sessions share one, kept in
-  `~/.local/state/runeterm/accents`) and, for most animals, a little animation (played when
-  you hover it) instead of the emoji: Lottie animations from LottieFiles, pre-rendered into `assets/animations/` (sources
-  and licence in `assets/animations/SOURCES.md`).
+  `~/.local/state/runeterm/accents`) and an animated mascot.
+
+## Mascots
+
+Every session gets a little animated mascot, one for each of spooky's animals:
+
+bee · bird · butterfly · cat · crab · dino · dog · dolphin · duck · elephant · fox · frog ·
+hedgehog · jellyfish · koala · lion · monkey · octopus · otter · owl · panda · parrot · paw ·
+penguin · rabbit · shark · sloth · snail · tiger · turtle · unicorn · whale
+
+- A mascot rests on a still frame and plays when you hover it, and plays through once every
+  10 seconds on its own. At rest it costs one small image and no redraws; its frames are
+  decoded only while it plays.
+- Change one in the session picker (click a session's mascot), or right-click the badge for
+  your own session's. A
+  session whose emoji has no mascot (an old one with a sports emoji, say) is given one nobody
+  else has.
+- They're free animations from [LottieFiles](https://lottiefiles.com) under the Lottie Simple
+  License, pre-rendered to frame sheets in `assets/animations/` (sources in
+  `assets/animations/SOURCES.md`).
 
 ## Build
 
