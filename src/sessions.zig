@@ -101,46 +101,63 @@ fn inUse(server: *Server, name: []const u8) bool {
 // Controller --------------------------------------------------------------
 
 pub fn controllerConnected(server: *Server, client: *Server.Client) void {
-    if (server.controller) |old| if (old != client) controllerGone(server, old);
-    server.controller = client;
+    if (client.controller) return;
+    server.controllers.append(server.gpa, client) catch return;
+    client.controller = true;
     server.sent_surfaces = null;
-    log.info("ghostty connected", .{});
+    log.info("controller connected ({d} now)", .{server.controllers.items.len});
 }
 
-/// Ghostty quit or disconnected: every session it showed is detached.
+/// A controller quit or disconnected: the sessions its windows showed are
+/// detached. Other controllers' windows are unaffected.
 pub fn controllerGone(server: *Server, client: *Server.Client) void {
-    if (server.controller != client) return;
-    server.controller = null;
-    if (server.last_report) |r| server.gpa.free(r);
-    server.last_report = null;
-    for (server.sessions.items) |*s| s.window = null;
-    log.info("ghostty disconnected", .{});
+    if (!client.controller) return;
+    client.controller = false;
+    if (std.mem.indexOfScalar(*Server.Client, server.controllers.items, client)) |i| {
+        _ = server.controllers.orderedRemove(i);
+    }
+    if (client.report) |r| server.gpa.free(r);
+    client.report = null;
+    applyReport(server);
+    log.info("controller disconnected ({d} left)", .{server.controllers.items.len});
 }
 
-pub fn handleReport(server: *Server, json: []const u8) void {
+pub fn handleReport(server: *Server, client: *Server.Client, json: []const u8) void {
     log.debug("layout report: {s}", .{json});
     const owned = server.gpa.dupe(u8, json) catch return;
-    if (server.last_report) |r| server.gpa.free(r);
-    server.last_report = owned;
+    if (client.report) |r| server.gpa.free(r);
+    client.report = owned;
     applyReport(server);
+}
+
+/// The most recently connected controller: where requests from outside
+/// any window (a CLI command) open their windows.
+fn defaultController(server: *Server) ?*Server.Client {
+    const n = server.controllers.items.len;
+    return if (n == 0) null else server.controllers.items[n - 1];
 }
 
 /// Match ghostty's windows to sessions. Called for every report and again
 /// whenever a client tells us its surface, since a report can arrive
 /// before the clients in a new window have connected.
 pub fn applyReport(server: *Server) void {
-    const raw = server.last_report orelse return;
     var arena_state: std.heap.ArenaAllocator = .init(server.gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const report = std.json.parseFromSliceLeaky(layout.Report, arena, raw, layout.parse_options) catch |err| {
-        log.warn("bad layout from ghostty: {}", .{err});
-        return;
-    };
+    // Every controller's windows, together.
+    var windows: std.ArrayList(layout.Window) = .empty;
+    for (server.controllers.items) |ctl| {
+        const raw = ctl.report orelse continue;
+        const report = std.json.parseFromSliceLeaky(layout.Report, arena, raw, layout.parse_options) catch |err| {
+            log.warn("bad layout report: {}", .{err});
+            continue;
+        };
+        windows.appendSlice(arena, report.windows) catch return;
+    }
 
     var seen: std.ArrayList(u64) = .empty;
-    for (report.windows) |win| {
+    for (windows.items) |win| {
         seen.append(arena, win.id) catch return;
         const saved = layout.mapTabs(arena, win.tabs, win.active, SurfaceToPane{ .server = server }) catch return;
         // None of this window's clients have connected yet.
@@ -262,7 +279,7 @@ pub fn handleClosed(server: *Server, payload: []const u8) void {
 /// session, so new tabs and splits opened from a pane run spooky too and
 /// each window can show its session's name. Only sent when it changed.
 pub fn sendSurfaces(server: *Server) void {
-    const controller = server.controller orelse return;
+    if (server.controllers.items.len == 0) return;
     var hasher: std.hash.Wyhash = .init(0);
     for (server.panes.items) |pane| {
         const client = pane.client orelse continue;
@@ -304,7 +321,7 @@ pub fn sendSurfaces(server: *Server) void {
         .surfaces = surfaces.items,
         .windows = windows.items,
     }, layout.stringify_options) catch return;
-    server.send(controller, .surfaces, json);
+    for (server.controllers.items) |controller| server.send(controller, .surfaces, json);
     server.sent_surfaces = hash;
 }
 
@@ -322,7 +339,13 @@ pub fn forSurface(server: *Server, surface: u64, buf: []u8) []const u8 {
 /// The window containing `surface`, per ghostty's last report.
 fn windowOf(server: *Server, surface: u64) ?u64 {
     if (surface == 0) return null;
-    const raw = server.last_report orelse return null;
+    for (server.controllers.items) |ctl| {
+        if (windowIn(server, ctl.report orelse continue, surface)) |w| return w;
+    }
+    return null;
+}
+
+fn windowIn(server: *Server, raw: []const u8, surface: u64) ?u64 {
     var arena_state: std.heap.ArenaAllocator = .init(server.gpa);
     defer arena_state.deinit();
     const report = std.json.parseFromSliceLeaky(layout.Report, arena_state.allocator(), raw, layout.parse_options) catch return null;
@@ -348,7 +371,10 @@ fn windowOf(server: *Server, surface: u64) ?u64 {
 /// `spooky attach NAME`, `spooky new NAME` and `spooky attach -p ID` from
 /// inside a pane: ask ghostty to open (or raise) the window.
 pub fn open(server: *Server, client: *Server.Client, kind: protocol.Prepare.Kind, pane_id: u32, name_: []const u8) void {
-    const controller = server.controller orelse return server.fail(client, protocol.no_controller);
+    // A controller asking for itself (a runeterm window switching sessions)
+    // gets the window back on its own connection, which stays open.
+    const controller = if (client.controller) client else defaultController(server) orelse
+        return server.fail(client, protocol.no_controller);
 
     var arena_state: std.heap.ArenaAllocator = .init(server.gpa);
     defer arena_state.deinit();
@@ -374,7 +400,8 @@ pub fn open(server: *Server, client: *Server.Client, kind: protocol.Prepare.Kind
                 if (s.window) |window| {
                     var id: [8]u8 = undefined;
                     std.mem.writeInt(u64, &id, window, .little);
-                    server.send(controller, .present_window, &id);
+                    // Whichever controller has the window raises it.
+                    for (server.controllers.items) |ctl| server.send(ctl, .present_window, &id);
                     break :request null;
                 }
                 break :request sessionWindow(server, arena, s) catch return;
@@ -398,6 +425,7 @@ pub fn open(server: *Server, client: *Server.Client, kind: protocol.Prepare.Kind
         _ => return server.fail(client, "malformed open request"),
     };
     const request = maybe orelse {
+        if (client.controller) return;
         server.send(client, .text, "");
         client.closing = true;
         return;
@@ -406,6 +434,7 @@ pub fn open(server: *Server, client: *Server.Client, kind: protocol.Prepare.Kind
     const json = std.json.Stringify.valueAlloc(arena, request, layout.stringify_options) catch return;
     log.debug("open window: {s}", .{json});
     server.send(controller, .open_window, json);
+    if (client.controller) return;
     server.send(client, .text, "");
     client.closing = true;
 }

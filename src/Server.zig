@@ -62,6 +62,11 @@ pub const Client = struct {
     closing: bool = false,
     /// GHOSTTY_SURFACE_ID of the surface this client runs in, or zero.
     surface: u64 = 0,
+    /// A terminal that announced itself as a controller (ghostty, or one
+    /// runeterm window process); see sessions.zig.
+    controller: bool = false,
+    /// The last layout this controller reported, as JSON.
+    report: ?[]u8 = null,
 };
 
 /// What the next plain `spooky` should attach to; see `Tag.prepare`.
@@ -109,10 +114,9 @@ last_output_ms: i64 = 0,
 active_session: []u8 = &.{},
 next: ?Next = null,
 sessions: std.ArrayList(sessionpkg.Session) = .empty,
-/// Ghostty, when connected with `spooky-integration`; see sessions.zig.
-controller: ?*Client = null,
-/// The last layout ghostty reported, as JSON.
-last_report: ?[]u8 = null,
+/// Terminals connected as controllers (ghostty with `spooky-integration`,
+/// runeterm); each reports its own windows. See sessions.zig.
+controllers: std.ArrayList(*Client) = .empty,
 /// Hash of the surfaces last sent to the controller; see `Tag.surfaces`.
 sent_surfaces: ?u64 = null,
 /// Path of this executable, for commands ghostty runs in new windows.
@@ -186,7 +190,7 @@ fn deinit(self: *Server) void {
     self.clearNext();
     for (self.sessions.items) |s| s.deinit(self.gpa);
     self.sessions.deinit(self.gpa);
-    if (self.last_report) |r| self.gpa.free(r);
+    self.controllers.deinit(self.gpa);
     sys.close(self.listen_fd);
 }
 
@@ -412,6 +416,7 @@ pub fn forgetDeparted(self: *Server, session: []const u8) void {
 
 fn freeClient(self: *Server, client: *Client) void {
     sessionpkg.controllerGone(self, client);
+    if (client.report) |r| self.gpa.free(r);
     if (client.pane) |pane| pane.detach();
     if (client.fd >= 0) sys.close(client.fd);
     client.in.deinit(self.gpa);
@@ -498,7 +503,7 @@ fn handleFrame(self: *Server, client: *Client, frame: protocol.Frame) void {
             // Further windows and splits pick up the rest of a session
             // after `spooky attach NAME`. Ghostty as the controller
             // reopens whole layouts instead.
-            if (req.flags.adopt and self.controller == null) {
+            if (req.flags.adopt and self.controllers.items.len == 0) {
                 if (self.claimable(self.active())) |pane| return self.attach(client, pane, req.size);
             }
 
@@ -506,7 +511,7 @@ fn handleFrame(self: *Server, client: *Client, frame: protocol.Frame) void {
             // in decides its session; a pane outside any session's window
             // starts a new one.
             var name_buf: [16]u8 = undefined;
-            if (session.len == 0) session = if (self.controller == null)
+            if (session.len == 0) session = if (self.controllers.items.len == 0)
                 self.active()
             else
                 sessionpkg.forSurface(self, client.surface, &name_buf);
@@ -586,8 +591,8 @@ fn handleFrame(self: *Server, client: *Client, frame: protocol.Frame) void {
         },
 
         .controller => sessionpkg.controllerConnected(self, client),
-        .layout => if (client == self.controller) sessionpkg.handleReport(self, frame.payload),
-        .closed => if (client == self.controller) sessionpkg.handleClosed(self, frame.payload),
+        .layout => if (client.controller) sessionpkg.handleReport(self, client, frame.payload),
+        .closed => if (client.controller) sessionpkg.handleClosed(self, frame.payload),
         .rename => sessionpkg.rename(self, client, frame.payload),
         .animal => sessionpkg.animalRequest(self, client, frame.payload),
         .remove => sessionpkg.remove(self, client, frame.payload),
