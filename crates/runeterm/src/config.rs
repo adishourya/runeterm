@@ -25,6 +25,8 @@ pub struct Config {
     /// only when something changed (`false`).
     pub shader_animation: ShaderAnimation,
     pub sidebar: Sidebar,
+    /// `scrollback-editor`: what ⌥E opens a split's scrollback in.
+    pub scrollback_editor: String,
 }
 
 /// The sidebar's settings.
@@ -83,6 +85,7 @@ impl Default for Config {
             shaders: vec![],
             shader_animation: ShaderAnimation::Focused,
             sidebar: Sidebar::default(),
+            scrollback_editor: "auto".into(),
         }
     }
 }
@@ -215,7 +218,12 @@ impl Config {
              sidebar-clock = {}\n\
              sidebar-battery = {}\n\
              # user@host under the session's name.\n\
-             sidebar-host = {}\n",
+             sidebar-host = {}\n\
+             \n\
+             # --- Keys ---\n\
+             # alt+e opens the focused split's scrollback in this editor. auto: $VISUAL,\n\
+             # $EDITOR, or the first of nvim, vim, hx, vi that's installed.\n\
+             scrollback-editor = {}\n",
             f.family,
             f.size,
             f.padding,
@@ -229,6 +237,7 @@ impl Config {
             self.sidebar.clock,
             self.sidebar.battery,
             self.sidebar.host,
+            self.scrollback_editor,
             sidebar = if self.sidebar.pinned { "pinned" } else { "hover" },
         )
     }
@@ -293,6 +302,7 @@ impl Config {
                 "sidebar-clock" => self.sidebar.clock = v != "false",
                 "sidebar-battery" => self.sidebar.battery = v != "false",
                 "sidebar-host" => self.sidebar.host = v != "false",
+                "scrollback-editor" if !v.is_empty() => self.scrollback_editor = v.to_string(),
                 "cursor-style" => {
                     self.cursor_style = match v {
                         "block" => CursorStyle::Block,

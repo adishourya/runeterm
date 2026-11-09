@@ -33,5 +33,6 @@ branch); without a daemon, runeterm runs plain local shells (`RUNETERM_LOCAL=1` 
 - `runeterm` opens a new session; `runeterm attach NAME` opens an existing one.
 - Settings: `~/.config/runeterm/config` (written from Ghostty's on first run). ⌥R reloads.
 - Keys: ⌥[ / ⌥- split, ⌥h/j/k/l focus, ⌥⇧h/j/k/l swap, ⌥w/a/s/d resize, ⌥↩ zoom, ⌥M minimize,
-  ⌥X close, ⌥T new tab, ⌥1–9 tabs.
+  ⌥X close, ⌥T new tab, ⌥1–9 tabs, ⌥/ pin or unpin the sidebar, ⌥E open the scrollback in
+  an editor (`scrollback-editor`).
 - Crashes are logged to `~/.local/state/runeterm/crash.log`.

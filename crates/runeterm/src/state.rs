@@ -76,6 +76,8 @@ pub struct State {
     next_tab: u32,
     /// `user@host`, for the sidebar.
     pub user_host: String,
+    /// The editor ⌥E opens the scrollback in.
+    pub scrollback_editor: String,
     /// The spooky session this window is, once the daemon has named it.
     pub session: Option<Session>,
     /// Whether the window has keyboard focus (for the cursor and shaders' `iFocus`).
@@ -147,6 +149,7 @@ impl State {
             slide: 1.0,
             next_tab: 0,
             user_host: user_host(),
+            scrollback_editor: config.scrollback_editor.clone(),
             session: None,
             window_focused: true,
             sidebar_open: false,
@@ -181,7 +184,7 @@ impl State {
         let source = if self.controller.is_some() {
             Source::New { cwd: cwd.as_deref(), session: &session }
         } else {
-            Source::Local { cwd: cwd.as_deref() }
+            Source::Local { cwd: cwd.as_deref(), command: None }
         };
         let id = self.next_id;
         self.next_id += 1;
@@ -583,11 +586,51 @@ impl State {
         self.active = (open.active as usize).min(self.tabs.len().saturating_sub(1));
     }
 
+    /// ⌥/: pins the sidebar open, or back to a rail that opens on hover.
+    pub fn toggle_sidebar(&mut self) {
+        self.sidebar.pinned = !self.sidebar.pinned;
+        self.sidebar_open = false;
+    }
+
+    /// ⌥E: the focused split's whole scrollback, in an editor, in a split zoomed over it.
+    /// Quitting the editor closes that split and brings the terminal back.
+    pub fn edit_scrollback(&mut self) {
+        let Some(pane) = self.focused_pane() else { return };
+        let text = pane.term.lock().unwrap().text();
+        let cwd = Some(pane.cwd.replacen('~', &std::env::var("HOME").unwrap_or_default(), 1));
+        let dir = std::env::var("XDG_RUNTIME_DIR").map(std::path::PathBuf::from).unwrap_or_else(|_| std::env::temp_dir()).join("runeterm");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(format!("scrollback-{}-{}.txt", pane.id, chrono::Local::now().format("%H%M%S")));
+        if let Err(e) = std::fs::write(&path, &text) {
+            eprintln!("runeterm: can't write the scrollback: {e}");
+            return;
+        }
+        let command = editor_command(&self.scrollback_editor, &path, text.lines().count());
+        let id = self.next_id;
+        self.next_id += 1;
+        match Pane::spawn(id, Source::Local { cwd: cwd.as_deref(), command: Some(&command) }, &self.theme, Some(Arc::new(wake))) {
+            Ok(mut p) => {
+                p.cleanup = Some(path);
+                p.program = command[0].rsplit('/').next().unwrap_or("vim").to_string();
+                self.panes.insert(id, p);
+                let tab = &mut self.tabs[self.active];
+                tab.root.split(tab.focused, id, Dir::Right);
+                tab.focused = id;
+                tab.zoomed = true;
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&path);
+                eprintln!("runeterm: can't start {}: {e}", self.scrollback_editor);
+            }
+        }
+    }
+
     /// Re-reads `~/.config/runeterm/config` (⌥R): new colours for every terminal now, and the
     /// renderer picks up the font, cursor and shaders on its next frame.
     pub fn reload_config(&mut self) {
         let c = Config::load();
         self.sidebar = c.sidebar;
+        self.scrollback_editor = c.scrollback_editor.clone();
         self.theme = Theme { ansi: c.theme.ansi, cursor_style: c.cursor_style, ..c.theme };
         for p in self.panes.values() {
             let mut t = p.term.lock().unwrap();
@@ -691,6 +734,8 @@ impl State {
                 Some('x') => { let id = self.tabs[self.active].focused; self.close(id); true }
                 Some('m') => { let id = self.tabs[self.active].focused; self.minimize(id); true }
                 Some('r') => { self.reload_config(); true }
+                Some('e') => { self.edit_scrollback(); true }
+                Some('/') => { self.toggle_sidebar(); true }
                 Some('t') => { self.new_tab_here(); true }
                 Some(c @ '1'..='9') => {
                     let i = c as usize - '1' as usize;
@@ -811,6 +856,20 @@ mod tests {
     }
 
     #[test]
+    fn editors_open_at_the_end() {
+        let p = std::path::Path::new("/tmp/s.txt");
+        let base = |c: Vec<String>| -> Vec<String> {
+            let mut c = c;
+            c[0] = c[0].rsplit('/').next().unwrap().to_string();
+            c
+        };
+        assert_eq!(base(editor_command("vim", p, 40)), vec!["vim", "+", "/tmp/s.txt"]);
+        assert_eq!(base(editor_command("nvim -R", p, 40)), vec!["nvim", "-R", "+", "/tmp/s.txt"]);
+        assert_eq!(base(editor_command("hx", p, 40)), vec!["hx", "/tmp/s.txt:40"]);
+        assert_eq!(base(editor_command("/usr/bin/less", p, 40)), vec!["less", "/tmp/s.txt"]);
+    }
+
+    #[test]
     fn the_last_split_in_view_cannot_be_minimized() {
         let mut s = state_with(1);
         let id = s.tabs[0].focused;
@@ -823,6 +882,47 @@ fn wake() {
     if let Some(w) = WAKER.get() {
         w();
     }
+}
+
+/// How to open `path` (of `lines` lines) in `editor` at its last line, where the user was.
+fn editor_command(editor: &str, path: &std::path::Path, lines: usize) -> Vec<String> {
+    let editor = if editor.is_empty() || editor == "auto" { auto_editor() } else { editor.to_string() };
+    let mut words: Vec<String> = editor.split_whitespace().map(String::from).collect();
+    if words.is_empty() {
+        words.push("vi".into());
+    }
+    words[0] = find_program(&words[0]).unwrap_or_else(|| words[0].clone());
+    let name = words[0].rsplit('/').next().unwrap_or("").to_string();
+    let file = path.display().to_string();
+    match name.as_str() {
+        "vim" | "nvim" | "vi" | "view" => words.extend(["+".to_string(), file]),
+        "hx" | "helix" => words.push(format!("{file}:{}", lines.max(1))),
+        _ => words.push(file),
+    }
+    words
+}
+
+/// `$VISUAL`, `$EDITOR`, or the first of nvim, vim, hx, vi that's installed.
+fn auto_editor() -> String {
+    for var in ["VISUAL", "EDITOR"] {
+        if let Ok(v) = std::env::var(var) {
+            if !v.trim().is_empty() {
+                return v;
+            }
+        }
+    }
+    ["nvim", "vim", "hx", "vi"].iter().find(|e| find_program(e).is_some()).unwrap_or(&"vi").to_string()
+}
+
+/// A program's full path: on the PATH, or in `~/.local/bin` (an app launcher's PATH often lacks
+/// it).
+fn find_program(name: &str) -> Option<String> {
+    if name.contains('/') {
+        return Some(name.to_string());
+    }
+    let mut dirs: Vec<std::path::PathBuf> = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
+    dirs.push(std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/bin"));
+    dirs.iter().map(|d| d.join(name)).find(|p| p.is_file()).map(|p| p.display().to_string())
 }
 
 /// `$USER@hostname`.

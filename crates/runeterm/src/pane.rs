@@ -58,8 +58,8 @@ pub enum Source<'a> {
     New { cwd: Option<&'a str>, session: &'a str },
     /// An existing daemon pane.
     Attach(u32),
-    /// A shell on a local pty, not kept by spooky.
-    Local { cwd: Option<&'a str> },
+    /// A local pty, not kept by spooky: a shell, or `command` (an editor on a scrollback dump).
+    Local { cwd: Option<&'a str>, command: Option<&'a [String]> },
 }
 
 enum Backend {
@@ -90,6 +90,16 @@ pub struct Pane {
     /// Shown in the header: the foreground program and the working directory.
     pub program: String,
     pub cwd: String,
+    /// A file to delete when the pane goes (a scrollback dump).
+    pub cleanup: Option<std::path::PathBuf>,
+}
+
+impl Drop for Pane {
+    fn drop(&mut self) {
+        if let Some(p) = &self.cleanup {
+            let _ = std::fs::remove_file(p);
+        }
+    }
 }
 
 fn new_terminal(sink: Sink, theme: &Theme, changed: Arc<AtomicBool>, attention: Arc<AtomicBool>) -> Arc<Mutex<Terminal>> {
@@ -167,12 +177,19 @@ impl Pane {
                 })?;
                 (term, sink, Backend::Spooky { stream }, cwd)
             }
-            Source::Local { cwd } => {
+            Source::Local { cwd, command } => {
                 let pair = native_pty_system()
                     .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
                     .map_err(std::io::Error::other)?;
                 let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-                let mut cmd = CommandBuilder::new(&shell);
+                let mut cmd = match command {
+                    Some([prog, args @ ..]) => {
+                        let mut c = CommandBuilder::new(prog);
+                        c.args(args);
+                        c
+                    }
+                    _ => CommandBuilder::new(&shell),
+                };
                 cmd.env("TERM", "xterm-256color");
                 cmd.env("COLORTERM", "truecolor");
                 cmd.env("TERM_PROGRAM", "runeterm");
@@ -227,6 +244,7 @@ impl Pane {
             attention,
             program,
             cwd: cwd.map(|d| tilde(&d)).unwrap_or_default(),
+            cleanup: None,
         })
     }
 

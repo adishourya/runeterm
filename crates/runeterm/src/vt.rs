@@ -218,6 +218,32 @@ impl Terminal {
         }
     }
 
+    /// Everything the terminal holds as plain text, scrollback included, with soft-wrapped
+    /// lines joined and trailing blanks trimmed: what ⌥E opens in an editor.
+    pub fn text(&self) -> String {
+        // SAFETY: the formatter borrows the terminal for this call only; the buffer it
+        // allocates is copied and freed here.
+        unsafe {
+            let mut f: sys::GhosttyFormatter = ptr::null_mut();
+            if sys::ghostty_formatter_terminal_new(ptr::null(), &mut f, self.raw) != sys::GHOSTTY_SUCCESS {
+                return String::new();
+            }
+            let yes = true;
+            sys::ghostty_formatter_set(f, sys::GHOSTTY_FORMATTER_OPT_UNWRAP, &yes as *const _ as *const c_void);
+            let (mut out, mut len) = (ptr::null_mut(), 0usize);
+            let r = sys::ghostty_formatter_format_alloc(f, ptr::null(), &mut out, &mut len);
+            let text = if r == sys::GHOSTTY_SUCCESS && !out.is_null() {
+                let t = String::from_utf8_lossy(std::slice::from_raw_parts(out, len)).into_owned();
+                sys::ghostty_free(ptr::null(), out, len);
+                t
+            } else {
+                String::new()
+            };
+            sys::ghostty_formatter_free(f);
+            text
+        }
+    }
+
     /// Scrolls the viewport by `rows` (negative is up, into scrollback).
     pub fn scroll(&mut self, rows: isize) {
         let mut b = sys::GhosttyTerminalScrollViewport::default();
@@ -761,6 +787,17 @@ mod tests {
         let plain_red_on_blue = (row[3].bg.unwrap(), row[3].fg);
         assert_eq!(plain_red_on_blue.0.0 < plain_red_on_blue.0.2, false, "explicit colours swap too: red background");
         assert!(row[3].fg.2 > row[3].fg.0, "and blue text");
+    }
+
+    #[test]
+    fn text_includes_the_scrollback() {
+        let mut t = Terminal::new(20, 3, Rec::default());
+        for i in 0..10 {
+            t.write(format!("line {i}\r\n").as_bytes());
+        }
+        let text = t.text();
+        assert!(text.contains("line 0"), "scrolled-off lines are there: {text:?}");
+        assert!(text.contains("line 9"));
     }
 
     #[test]
