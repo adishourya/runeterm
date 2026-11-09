@@ -1,0 +1,16 @@
+[workspace]
+resolver = "3"
+members = ["crates/ghostty-vt-sys", "crates/runeterm"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.99"
+license = "MIT"
+
+[workspace.dependencies]
+ghostty-vt-sys = { path = "crates/ghostty-vt-sys" }
+# Rune is pre-release: pin a rev of `dev` (never rewritten).
+rune = { git = "https://github.com/anomalyco/rune", rev = "a6a59e697df7e7a7c95b91c915d1a24e00681760" }
+
+[profile.dev.package."*"]
+opt-level = 2

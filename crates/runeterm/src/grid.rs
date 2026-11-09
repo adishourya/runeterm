@@ -1,0 +1,1169 @@
+//! The terminal grid renderer: a Rune `Compositor` that draws Rune's frame and, at each pane's
+//! effect slot, that pane's cells, glyphs and cursor with its own pipeline and glyph atlas.
+
+use crate::config::{Config, ShaderAnimation};
+use crate::shader;
+use crate::state::State;
+use crate::vt::{Cell, CursorStyle, Frame, Layer, Placement, RenderState, Rgb};
+use bytemuck::{Pod, Zeroable};
+use rune::compose::{Compositor, DeviceKey, Frame as RuneFrame};
+use rune::render::{CLIP_WGSL, EffectSite};
+use std::collections::HashMap;
+use std::sync::atomic::Ordering;
+use swash::scale::{Render, ScaleContext, Source, StrikeWith};
+use swash::scale::image::Content;
+use swash::zeno::Format;
+use swash::FontRef;
+
+const ATLAS: u32 = 2048;
+
+/// Font settings, in Rune points.
+#[derive(Clone)]
+pub struct FontSpec {
+    pub family: String,
+    pub size: f32,
+    /// Extra line height, as a fraction (`line-height = 31%` is 0.31)…
+    pub cell_height: f32,
+    /// …or in pixels (`line-height = 4`).
+    pub cell_height_px: f32,
+    /// Space between the pane's edge and the grid.
+    pub padding: f32,
+}
+
+/// Regular, bold, italic and bold italic, then fallbacks found per character (emoji, CJK,
+/// symbols the font lacks), by asking fontconfig which installed font covers it.
+struct Fonts {
+    data: [Option<Box<[u8]>>; 4],
+    extra: Vec<Box<[u8]>>,
+    paths: HashMap<String, usize>,
+    by_char: HashMap<char, Option<usize>>,
+}
+
+fn read_font(pattern: &str) -> Option<(String, Box<[u8]>)> {
+    let out = std::process::Command::new("fc-match").args(["-f", "%{file}", pattern]).output().ok()?;
+    let path = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    let data = std::fs::read(&path).ok()?.into_boxed_slice();
+    Some((path, data))
+}
+
+impl Fonts {
+    fn load(family: &str) -> Fonts {
+        let style = |s: &str| {
+            let pattern = if s.is_empty() { family.to_string() } else { format!("{family}:{s}") };
+            read_font(&pattern).map(|(_, d)| d)
+        };
+        Fonts {
+            data: [style(""), style("bold"), style("italic"), style("bold:italic")],
+            extra: vec![],
+            paths: HashMap::new(),
+            by_char: HashMap::new(),
+        }
+    }
+
+    fn get(&self, style: usize) -> Option<FontRef<'_>> {
+        let d = self.data[style].as_deref().or(self.data[style & 1].as_deref()).or(self.data[0].as_deref())?;
+        FontRef::from_index(d, 0)
+    }
+
+    /// A font with a glyph for `ch`: the styled one, the regular one, or a fallback.
+    /// Returns a font index for `font` (0–3 styles, 4+ fallbacks) and the glyph id.
+    fn resolve(&mut self, ch: char, style: usize) -> Option<(usize, u16)> {
+        for i in [style, 0] {
+            if let Some(f) = self.get(i) {
+                let gid = f.charmap().map(ch);
+                if gid != 0 {
+                    return Some((i, gid));
+                }
+            }
+        }
+        let fallback = match self.by_char.get(&ch) {
+            Some(f) => *f,
+            None => {
+                let found = self.find_fallback(ch);
+                self.by_char.insert(ch, found);
+                found
+            }
+        }?;
+        let gid = FontRef::from_index(&self.extra[fallback], 0)?.charmap().map(ch);
+        (gid != 0).then_some((4 + fallback, gid))
+    }
+
+    fn find_fallback(&mut self, ch: char) -> Option<usize> {
+        // Emoji first ask for a colour font.
+        let emoji = (ch as u32) >= 0x1F000 || matches!(ch as u32, 0x2600..=0x27BF | 0x2B00..=0x2BFF);
+        let pattern = if emoji { format!(":charset={:x}:color=true", ch as u32) } else { format!(":charset={:x}", ch as u32) };
+        let (path, data) = read_font(&pattern)?;
+        let i = match self.paths.get(&path) {
+            Some(&i) => i,
+            None => {
+                self.extra.push(data);
+                self.paths.insert(path, self.extra.len() - 1);
+                self.extra.len() - 1
+            }
+        };
+        let gid = FontRef::from_index(&self.extra[i], 0)?.charmap().map(ch);
+        (gid != 0).then_some(i)
+    }
+
+    fn font(&self, i: usize) -> Option<FontRef<'_>> {
+        if i < 4 { self.get(i) } else { FontRef::from_index(self.extra.get(i - 4)?, 0) }
+    }
+}
+
+/// Cell size and baseline in device pixels.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Metrics {
+    pub w: f32,
+    pub h: f32,
+    baseline: f32,
+    px: f32,
+}
+
+#[derive(Clone, Copy)]
+struct Slot {
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    left: i32,
+    top: i32,
+    /// In the colour (RGBA) atlas: an emoji, drawn scaled into its cells.
+    color: bool,
+}
+
+/// One shelf packer over an `ATLAS`-sized texture.
+#[derive(Default)]
+struct Shelves {
+    pen: (u32, u32),
+    shelf: u32,
+}
+
+impl Shelves {
+    fn place(&mut self, w: u32, h: u32) -> Option<(u32, u32)> {
+        if self.pen == (0, 0) {
+            self.pen = (1, 1);
+        }
+        if self.pen.0 + w + 1 > ATLAS {
+            self.pen = (1, self.pen.1 + self.shelf + 1);
+            self.shelf = 0;
+        }
+        if self.pen.1 + h + 1 > ATLAS || w + 2 > ATLAS {
+            return None; // Full. A terminal rarely gets here; a clear-and-refill comes later.
+        }
+        let at = self.pen;
+        self.pen.0 += w + 1;
+        self.shelf = self.shelf.max(h);
+        Some(at)
+    }
+}
+
+/// Glyphs rasterized into textures packed on shelves: coverage (R8) for text, and RGBA for
+/// colour glyphs (emoji).
+struct Atlas {
+    glyphs: HashMap<(char, u8), Option<Slot>>,
+    mask: Shelves,
+    color: Shelves,
+    uploads: Vec<(Slot, Vec<u8>)>,
+}
+
+impl Atlas {
+    fn new() -> Atlas {
+        Atlas { glyphs: HashMap::new(), mask: Shelves::default(), color: Shelves::default(), uploads: vec![] }
+    }
+
+    /// Finds room for a `w` × `h` bitmap and queues its upload.
+    fn pack(&mut self, w: u32, h: u32, left: i32, top: i32, data: Vec<u8>, color: bool) -> Option<Slot> {
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let (x, y) = if color { self.color.place(w, h)? } else { self.mask.place(w, h)? };
+        let s = Slot { x, y, w, h, left, top, color };
+        self.uploads.push((s, data));
+        Some(s)
+    }
+
+    fn get(&mut self, ctx: &mut ScaleContext, fonts: &mut Fonts, m: &Metrics, ch: char, style: u8) -> Option<Slot> {
+        if let Some(s) = self.glyphs.get(&(ch, style)) {
+            return *s;
+        }
+        let slot = if let Some(sp) = crate::sprite::draw(ch, m.w as u32, m.h as u32, (m.px / 16.0).round().max(1.0)) {
+            // Drawn by us at exactly cell size; its top is the cell's top.
+            self.pack(sp.w, sp.h, 0, m.baseline as i32, sp.data, false)
+        } else {
+            (|| {
+                let (fi, gid) = fonts.resolve(ch, style as usize)?;
+                let font = fonts.font(fi)?;
+                let mut scaler = ctx.builder(font).size(m.px).hint(true).build();
+                if scaler.has_color_bitmaps() || scaler.has_color_outlines() {
+                    // Colour emoji: an RGBA image, scaled into its cells when drawn.
+                    let img = Render::new(&[Source::ColorOutline(0), Source::ColorBitmap(StrikeWith::BestFit), Source::Outline]).render(&mut scaler, gid)?;
+                    let p = img.placement;
+                    if img.content == Content::Color {
+                        return self.pack(p.width, p.height, p.left, p.top, img.data, true);
+                    }
+                    return self.pack(p.width, p.height, p.left, p.top, img.data, false);
+                }
+                let img = Render::new(&[Source::Outline]).format(Format::Alpha).render(&mut scaler, gid)?;
+                let p = img.placement;
+                self.pack(p.width, p.height, p.left, p.top, img.data, false)
+            })()
+        };
+        self.glyphs.insert((ch, style), slot);
+        slot
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Default)]
+struct Inst {
+    pos: [f32; 2],
+    size: [f32; 2],
+    uv: [f32; 2],
+    color: [f32; 4],
+    kind: u32,
+    _pad: u32,
+    /// Images only: the source rectangle's size, in normalized texture coordinates.
+    uv_size: [f32; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct Uniforms {
+    origin: [f32; 4],
+    target: [f32; 4],
+    clip: [f32; 4],
+    fade: [u32; 4],
+    flags: [u32; 4],
+}
+
+fn rgba(c: Rgb, a: f32) -> [f32; 4] {
+    [c.0 as f32 / 255.0, c.1 as f32 / 255.0, c.2 as f32 / 255.0, a]
+}
+
+/// A row's instances: backgrounds first, then glyphs and decorations.
+#[derive(Default, Clone)]
+struct Row {
+    bg: Vec<Inst>,
+    fg: Vec<Inst>,
+}
+
+/// Where a pane's slot was last drawn.
+#[derive(Clone, Copy)]
+struct Site {
+    rect: [f32; 4],
+    scale: f32,
+}
+
+/// A pane's offscreen targets for its shader chain: the grid goes into `tex[0]`, and each
+/// shader reads one and writes the other.
+struct Offscreen {
+    size: (u32, u32),
+    views: [wgpu::TextureView; 2],
+    /// Shader bind groups reading `views[i]`.
+    reads: [wgpu::BindGroup; 2],
+    /// Image-slot bind groups showing `views[i]` in the pane.
+    shows: [wgpu::BindGroup; 2],
+    globals: wgpu::Buffer,
+    /// Which view holds the result after the chain.
+    result: usize,
+}
+
+/// GPU and cached state for one pane.
+struct PaneGpu {
+    rs: RenderState,
+    rows: Vec<Row>,
+    colors: (Rgb, Rgb),
+    /// Cell backgrounds then text, rebuilt when rows change.
+    body: Vec<Inst>,
+    body_bg: usize,
+    placements: Vec<Placement>,
+    /// Pixels read under the terminal lock, waiting for a texture.
+    pending: Vec<(u32, u64, u32, u32, Vec<u8>)>,
+    /// This frame's draw list: body, cursor, then images.
+    instances: Vec<Inst>,
+    text_end: u32,
+    image_draws: Vec<(Layer, u32, u32)>,
+    /// The grid size the terminal has, and a size waiting for the layout to settle.
+    grid: Option<(u16, u16)>,
+    pending_grid: Option<((u16, u16), f64)>,
+    /// Cursor: what the terminal says, where we draw it (gliding), and for shaders where it was.
+    cursor: Option<crate::vt::Cursor>,
+    cursor_rect: [f32; 4],
+    cursor_drawn: [f32; 4],
+    cursor_prev: [f32; 4],
+    cursor_style: i32,
+    cursor_prev_style: i32,
+    cursor_changed: f64,
+    site: Option<Site>,
+    prepared: bool,
+    buf: wgpu::Buffer,
+    cap: usize,
+    /// Uniforms and bind group for drawing into the window, and for drawing offscreen.
+    slot_u: wgpu::Buffer,
+    slot_bind: wgpu::BindGroup,
+    off_u: wgpu::Buffer,
+    off_bind: wgpu::BindGroup,
+    offscreen: Option<Offscreen>,
+}
+
+/// One image's texture, made for a generation of its pixels.
+struct ImageTex {
+    generation: u64,
+    size: (u32, u32),
+    bind: wgpu::BindGroup,
+}
+
+struct Gpu {
+    key: DeviceKey,
+    bgl: wgpu::BindGroupLayout,
+    image_bgl: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    /// Bound for draws without an image, as the layout always has an image slot.
+    no_image: wgpu::BindGroup,
+    layout: wgpu::PipelineLayout,
+    module: wgpu::ShaderModule,
+    pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
+    atlas_tex: wgpu::Texture,
+    atlas_view: wgpu::TextureView,
+    color_tex: wgpu::Texture,
+    color_view: wgpu::TextureView,
+    chain: Option<shader::Chain>,
+}
+
+/// A texture holding RGBA pixels, bound for the image slot.
+fn image_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    queue: Option<&wgpu::Queue>,
+    w: u32,
+    h: u32,
+    rgba: &[u8],
+) -> wgpu::BindGroup {
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("runeterm image"),
+        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    if let Some(queue) = queue {
+        queue.write_texture(
+            tex.as_image_copy(),
+            rgba,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: None },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+    }
+    let view = tex.create_view(&Default::default());
+    view_bind_group(device, layout, sampler, &view)
+}
+
+fn view_bind_group(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, sampler: &wgpu::Sampler, view: &wgpu::TextureView) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("runeterm image"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(view) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
+        ],
+    })
+}
+
+fn uniform_buffer(device: &wgpu::Device, size: usize) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("runeterm uniforms"),
+        size: size as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+impl Gpu {
+    fn new(device: &wgpu::Device, key: DeviceKey, shaders: &[String]) -> Gpu {
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("runeterm grid"),
+            source: wgpu::ShaderSource::Wgsl(format!("{CLIP_WGSL}\n{}", include_str!("grid.wgsl")).into()),
+        });
+        let entry = |binding, ty| wgpu::BindGroupLayoutEntry { binding, visibility: wgpu::ShaderStages::VERTEX_FRAGMENT, ty, count: None };
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("runeterm grid"),
+            entries: &[
+                entry(0, wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }),
+                entry(1, wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                }),
+                entry(2, wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                }),
+                entry(3, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)),
+            ],
+        });
+        let image_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("runeterm image"),
+            entries: &[
+                entry(0, wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                }),
+                entry(1, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)),
+            ],
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("runeterm grid"),
+            bind_group_layouts: &[Some(&bgl), Some(&image_bgl)],
+            immediate_size: 0,
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let atlas_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("runeterm atlas"),
+            size: wgpu::Extent3d { width: ATLAS, height: ATLAS, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let atlas_view = atlas_tex.create_view(&Default::default());
+        let color_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("runeterm colour atlas"),
+            size: wgpu::Extent3d { width: ATLAS, height: ATLAS, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let color_view = color_tex.create_view(&Default::default());
+        let no_image = image_bind_group(device, &image_bgl, &sampler, None, 1, 1, &[0; 4]);
+        let chain = (!shaders.is_empty()).then(|| shader::Chain::new(device, shaders));
+        Gpu { key, bgl, image_bgl, sampler, no_image, layout, module, pipelines: HashMap::new(), atlas_tex, atlas_view, color_tex, color_view, chain }
+    }
+
+    fn image(&self, device: &wgpu::Device, queue: &wgpu::Queue, w: u32, h: u32, rgba: &[u8]) -> wgpu::BindGroup {
+        image_bind_group(device, &self.image_bgl, &self.sampler, Some(queue), w, h, rgba)
+    }
+
+    fn pipeline(&mut self, device: &wgpu::Device, format: wgpu::TextureFormat) -> &wgpu::RenderPipeline {
+        let (layout, module) = (&self.layout, &self.module);
+        self.pipelines.entry(format).or_insert_with(|| {
+            let attrs = wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x2, 3 => Float32x4, 4 => Uint32, 5 => Uint32, 6 => Float32x2];
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("runeterm grid"),
+                layout: Some(layout),
+                vertex: wgpu::VertexState {
+                    module,
+                    entry_point: Some("vs"),
+                    compilation_options: Default::default(),
+                    buffers: &[Some(wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<Inst>() as u64,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &attrs,
+                    })],
+                },
+                primitive: Default::default(),
+                depth_stencil: None,
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module,
+                    entry_point: Some("fs"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        })
+    }
+
+    fn grid_bind(&self, device: &wgpu::Device, u: &wgpu::Buffer) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("runeterm grid"),
+            layout: &self.bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: u.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&self.atlas_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.color_view) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+            ],
+        })
+    }
+
+    fn pane(&self, device: &wgpu::Device) -> PaneGpu {
+        let cap = 4096;
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("runeterm cells"),
+            size: (cap * std::mem::size_of::<Inst>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let slot_u = uniform_buffer(device, std::mem::size_of::<Uniforms>());
+        let off_u = uniform_buffer(device, std::mem::size_of::<Uniforms>());
+        PaneGpu {
+            rs: RenderState::new(),
+            rows: vec![],
+            colors: (Rgb(255, 255, 255), Rgb(0, 0, 0)),
+            body: vec![],
+            body_bg: 0,
+            placements: vec![],
+            pending: vec![],
+            instances: vec![],
+            text_end: 0,
+            image_draws: vec![],
+            grid: None,
+            pending_grid: None,
+            cursor: None,
+            cursor_rect: [0.0; 4],
+            cursor_drawn: [0.0; 4],
+            cursor_prev: [0.0; 4],
+            cursor_style: 2,
+            cursor_prev_style: 2,
+            cursor_changed: 0.0,
+            site: None,
+            prepared: false,
+            slot_bind: self.grid_bind(device, &slot_u),
+            off_bind: self.grid_bind(device, &off_u),
+            buf,
+            cap,
+            slot_u,
+            off_u,
+            offscreen: None,
+        }
+    }
+
+    /// Offscreen targets of `size` for a pane's shader chain.
+    fn offscreen(&self, device: &wgpu::Device, size: (u32, u32)) -> Offscreen {
+        let chain = self.chain.as_ref().unwrap();
+        let globals = uniform_buffer(device, std::mem::size_of::<shader::Globals>());
+        let make = || {
+            device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some("runeterm offscreen"),
+                    size: wgpu::Extent3d { width: size.0.max(1), height: size.1.max(1), depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: shader::FORMAT,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                })
+                .create_view(&Default::default())
+        };
+        let views = [make(), make()];
+        let read = |v: &wgpu::TextureView| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("runeterm shader input"),
+                layout: &chain.layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: globals.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(v) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&chain.sampler) },
+                ],
+            })
+        };
+        let reads = [read(&views[0]), read(&views[1])];
+        let shows = [
+            view_bind_group(device, &self.image_bgl, &self.sampler, &views[0]),
+            view_bind_group(device, &self.image_bgl, &self.sampler, &views[1]),
+        ];
+        Offscreen { size, views, reads, shows, globals, result: 0 }
+    }
+}
+
+/// Draws Rune's frame plus every pane's grid.
+pub struct GridRenderer {
+    spec: FontSpec,
+    fonts: Fonts,
+    ctx: ScaleContext,
+    metrics: Option<Metrics>,
+    atlas: Atlas,
+    gpu: Option<Gpu>,
+    panes: HashMap<u32, PaneGpu>,
+    /// Image textures by (pane, image id).
+    textures: HashMap<(u32, u32), ImageTex>,
+    theme: crate::pane::Theme,
+    cursor_opacity: f32,
+    cursor_smooth: bool,
+    shaders: Vec<String>,
+    shader_animation: ShaderAnimation,
+    /// The config generation applied (see `config::publish`).
+    generation: u64,
+    /// Seconds since the first frame.
+    time: f64,
+    frame: i32,
+    /// Something is still moving: keep frames coming.
+    moving: bool,
+    /// The panes drawn last frame: the ones to update (and run shaders for) before the next.
+    last_seen: Vec<u32>,
+}
+
+impl GridRenderer {
+    pub fn new(config: &Config) -> GridRenderer {
+        let fonts = Fonts::load(&config.font.family);
+        let shaders = config.shaders.iter().filter_map(|p| shader::load(p)).collect();
+        GridRenderer {
+            generation: crate::config::generation(),
+            spec: config.font.clone(),
+            fonts,
+            ctx: ScaleContext::new(),
+            metrics: None,
+            atlas: Atlas::new(),
+            gpu: None,
+            panes: HashMap::new(),
+            textures: HashMap::new(),
+            theme: crate::pane::Theme { ansi: config.theme.ansi, ..config.theme },
+            cursor_opacity: config.cursor_opacity,
+            cursor_smooth: config.cursor_smooth,
+            shaders,
+            shader_animation: config.shader_animation,
+            time: 0.0,
+            frame: 0,
+            moving: true,
+            last_seen: vec![],
+        }
+    }
+
+    /// Takes a reloaded config: new font, colours, cursor and shaders. Everything GPU-side is
+    /// rebuilt on the next frame, and every pane redraws (and resizes, if the cell size changed).
+    fn reload(&mut self, config: &Config) {
+        self.spec = config.font.clone();
+        self.fonts = Fonts::load(&config.font.family);
+        self.metrics = None;
+        self.atlas = Atlas::new();
+        self.theme = crate::pane::Theme { ansi: config.theme.ansi, ..config.theme };
+        self.cursor_opacity = config.cursor_opacity;
+        self.cursor_smooth = config.cursor_smooth;
+        self.shaders = config.shaders.iter().filter_map(|p| shader::load(p)).collect();
+        self.shader_animation = config.shader_animation;
+        self.gpu = None;
+        self.panes.clear();
+        self.textures.clear();
+    }
+
+    /// Cell metrics at `scale` device pixels per point. Ghostty sizes fonts in points at 96 dpi.
+    fn metrics_for(&self, scale: f32) -> Metrics {
+        let px = (self.spec.size * 96.0 / 72.0 * scale).round();
+        let Some(font) = self.fonts.get(0) else {
+            return Metrics { w: (px * 0.6).round(), h: (px * 1.3).round(), baseline: px, px };
+        };
+        let m = font.metrics(&[]).scale(px);
+        let gid = font.charmap().map('M');
+        let w = font.glyph_metrics(&[]).scale(px).advance_width(gid).round().max(1.0);
+        let natural = m.ascent + m.descent + m.leading;
+        let h = (natural * (1.0 + self.spec.cell_height) + self.spec.cell_height_px * scale).round().max(1.0);
+        let baseline = ((h - (m.ascent + m.descent)) / 2.0 + m.ascent).round();
+        Metrics { w, h, baseline, px }
+    }
+
+    /// Builds one row's instances.
+    fn build_row(&mut self, m: Metrics, pad: f32, y: usize, cells: &[Cell], frame_fg: Rgb) -> Row {
+        let mut row = Row::default();
+        let top = pad + y as f32 * m.h;
+        let sel_bg = Rgb(0x3b, 0x4a, 0x63);
+        for (x, c) in cells.iter().enumerate() {
+            let left = pad + x as f32 * m.w;
+            let bg = if c.selected { Some(sel_bg) } else { c.bg };
+            if let Some(bg) = bg {
+                // Extend the previous run if it's the same color and adjacent.
+                match row.bg.last_mut() {
+                    Some(last) if last.color == rgba(bg, 1.0) && (last.pos[0] + last.size[0] - left).abs() < 0.5 && last.pos[1] == top => {
+                        last.size[0] += m.w;
+                    }
+                    _ => row.bg.push(Inst { pos: [left, top], size: [m.w, m.h], color: rgba(bg, 1.0), ..Default::default() }),
+                }
+            }
+            let fg = if c.selected { frame_fg } else { c.fg };
+            if let Some(ch) = c.text.chars().next().filter(|ch| !ch.is_whitespace()) {
+                let style = c.bold as u8 | (c.italic as u8) << 1;
+                if let Some(s) = self.atlas.get(&mut self.ctx, &mut self.fonts, &m, ch, style).filter(|s| s.color) {
+                    // An emoji fills the height of its two cells, centred, keeping its shape.
+                    let span = if cells.get(x + 1).is_some_and(|n| n.text.is_empty()) { 2.0 } else { 1.0 };
+                    let h = (m.h * 0.86).min(span * m.w * s.h as f32 / s.w as f32);
+                    let w = h * s.w as f32 / s.h as f32;
+                    row.fg.push(Inst {
+                        pos: [(left + (span * m.w - w) / 2.0).round(), (top + (m.h - h) / 2.0).round()],
+                        size: [w, h],
+                        uv: [s.x as f32 / ATLAS as f32, s.y as f32 / ATLAS as f32],
+                        uv_size: [s.w as f32 / ATLAS as f32, s.h as f32 / ATLAS as f32],
+                        color: [1.0; 4],
+                        kind: 4,
+                        _pad: 0,
+                    });
+                } else if let Some(s) = self.atlas.get(&mut self.ctx, &mut self.fonts, &m, ch, style) {
+                    row.fg.push(Inst {
+                        pos: [(left + s.left as f32).round(), (top + m.baseline - s.top as f32).round()],
+                        size: [s.w as f32, s.h as f32],
+                        uv: [s.x as f32, s.y as f32],
+                        color: rgba(fg, 1.0),
+                        kind: 1,
+                        ..Default::default()
+                    });
+                }
+            }
+            if c.underline {
+                let t = (m.px / 14.0).round().max(1.0);
+                row.fg.push(Inst { pos: [left, top + m.baseline + t * 2.0], size: [m.w, t], color: rgba(fg, 1.0), ..Default::default() });
+            }
+        }
+        row
+    }
+
+    fn metrics_at(&mut self, scale: f32) -> Metrics {
+        match self.metrics {
+            Some(m) if (m.px - (self.spec.size * 96.0 / 72.0 * scale).round()).abs() < 0.5 => m,
+            _ => {
+                // New scale: new glyphs, and every pane redraws in full.
+                let m = self.metrics_for(scale);
+                self.metrics = Some(m);
+                self.atlas = Atlas::new();
+                for p in self.panes.values_mut() {
+                    p.rs = RenderState::new();
+                    p.rows.clear();
+                }
+                m
+            }
+        }
+    }
+
+    /// Brings a pane's draw list up to date for this frame and uploads it. False if the pane
+    /// is gone.
+    fn prepare(&mut self, s: &State, id: u32, site: Site, device: &wgpu::Device, queue: &wgpu::Queue, dt: f32) -> bool {
+        let Some(pane) = s.panes.get(&id) else { return false };
+        let m = self.metrics_at(site.scale);
+        let rect = site.rect;
+        let pad = (self.spec.padding * site.scale).round();
+        let want = (
+            (((rect[2] - 2.0 * pad) / m.w).floor() as i32).clamp(2, 1000) as u16,
+            (((rect[3] - 2.0 * pad) / m.h).floor() as i32).clamp(1, 500) as u16,
+        );
+
+        let gpu = self.gpu.as_ref().unwrap();
+        let p = self.panes.entry(id).or_insert_with(|| gpu.pane(device));
+        p.site = Some(site);
+        // Resize the terminal once the layout settles, not on every frame of a spring.
+        match (p.grid, p.pending_grid) {
+            (None, _) => {
+                pane.resize(want.0, want.1, m.w as u32, m.h as u32);
+                p.grid = Some(want);
+            }
+            (Some(g), _) if g == want => p.pending_grid = None,
+            (Some(_), Some((w, since))) if w == want && self.time - since >= 0.08 => {
+                pane.resize(want.0, want.1, m.w as u32, m.h as u32);
+                p.grid = Some(want);
+                p.pending_grid = None;
+            }
+            (Some(_), Some((w, _))) if w == want => {}
+            _ => p.pending_grid = Some((want, self.time)),
+        }
+
+        let textures = &self.textures;
+        let frame: Frame = {
+            let t = pane.term.lock().unwrap();
+            pane.dirty.store(false, Ordering::Release);
+            p.rs.begin(&t);
+            let frame = p.rs.finish();
+            // Pixels are only readable while we hold the terminal: copy the ones we lack.
+            if let Some(list) = &frame.images {
+                for pl in list {
+                    let have = textures.get(&(id, pl.image)).is_some_and(|x| x.generation == pl.generation)
+                        || p.pending.iter().any(|q| q.0 == pl.image && q.1 == pl.generation);
+                    if !have {
+                        if let Some((w, h, px)) = t.image_rgba(pl.image) {
+                            p.pending.push((pl.image, pl.generation, w, h, px));
+                        }
+                    }
+                }
+            }
+            frame
+        };
+        let mut p = self.panes.remove(&id).unwrap();
+        if let Some(list) = frame.images.clone() {
+            p.placements = list;
+        }
+        if p.rows.len() != frame.rows as usize {
+            p.rows.resize(frame.rows as usize, Row::default());
+        }
+        let mut body_changed = p.colors != (frame.fg, frame.bg) || p.body.is_empty();
+        p.colors = (frame.fg, frame.bg);
+        for (y, r) in frame.dirty_rows.iter().enumerate() {
+            if let Some(cells) = r {
+                p.rows[y] = self.build_row(m, pad, y, cells, frame.bg);
+                body_changed = true;
+            }
+        }
+        if body_changed {
+            p.body.clear();
+            for r in &p.rows {
+                p.body.extend_from_slice(&r.bg);
+            }
+            p.body_bg = p.body.len();
+            for r in &p.rows {
+                p.body.extend_from_slice(&r.fg);
+            }
+        }
+
+        // The cursor: an unfocused pane shows a hollow block, as Ghostty does.
+        let focused = s.focused_id() == Some(id);
+        let c = frame.cursor;
+        let style = if focused { c.style } else { CursorStyle::BlockHollow };
+        let bar = (site.scale * 2.0).round().max(1.0);
+        let (x, y) = (pad + c.x as f32 * m.w, pad + c.y as f32 * m.h);
+        let target = match style {
+            CursorStyle::Bar => [x, y, bar, m.h],
+            CursorStyle::Underline => [x, y + m.h - bar, m.w, bar],
+            _ => [x, y, m.w, m.h],
+        };
+        if target != p.cursor_rect || p.cursor.is_none() {
+            p.cursor_prev = if p.cursor.is_none() { target } else { p.cursor_rect };
+            p.cursor_prev_style = p.cursor_style;
+            p.cursor_changed = self.time;
+            p.cursor_rect = target;
+            if p.cursor.is_none() || !self.cursor_smooth {
+                p.cursor_drawn = target;
+            }
+        }
+        p.cursor_style = shader::style_number(style);
+        p.cursor = Some(c);
+        // Glide toward the target: fast, critically damped, snapping when close.
+        let k = 1.0 - (-dt * 30.0).exp();
+        let mut moving = false;
+        for i in 0..4 {
+            let d = p.cursor_rect[i] - p.cursor_drawn[i];
+            if d.abs() < 0.5 {
+                p.cursor_drawn[i] = p.cursor_rect[i];
+            } else {
+                p.cursor_drawn[i] += d * k;
+                moving = true;
+            }
+        }
+        self.moving |= moving || p.pending_grid.is_some();
+
+        // This frame's list: body, cursor, images.
+        p.instances.clear();
+        p.instances.extend_from_slice(&p.body);
+        if c.visible && self.cursor_opacity > 0.0 {
+            let [x, y, w, h] = p.cursor_drawn;
+            let col = self.theme.cursor;
+            let quad = |pos: [f32; 2], size: [f32; 2], a: f32| Inst { pos, size, color: rgba(col, a * self.cursor_opacity), ..Default::default() };
+            match style {
+                CursorStyle::BlockHollow => {
+                    p.instances.push(quad([x, y], [w, bar], 1.0));
+                    p.instances.push(quad([x, y + h - bar], [w, bar], 1.0));
+                    p.instances.push(quad([x, y], [bar, h], 1.0));
+                    p.instances.push(quad([x + w - bar, y], [bar, h], 1.0));
+                }
+                CursorStyle::Block => p.instances.push(quad([x, y], [w, h], 0.75)),
+                _ => p.instances.push(quad([x, y], [w, h], 1.0)),
+            }
+        }
+        p.text_end = p.instances.len() as u32;
+        p.image_draws.clear();
+        for pl in &p.placements {
+            let (iw, ih) = self
+                .textures
+                .get(&(id, pl.image))
+                .map(|t| t.size)
+                .or_else(|| p.pending.iter().find(|q| q.0 == pl.image).map(|q| (q.2, q.3)))
+                .unwrap_or((1, 1));
+            let x = pad + pl.col as f32 * m.w + pl.offset[0] as f32;
+            let y = pad + pl.row as f32 * m.h + pl.offset[1] as f32;
+            p.image_draws.push((pl.layer, p.instances.len() as u32, pl.image));
+            p.instances.push(Inst {
+                pos: [x, y],
+                size: [pl.size[0] as f32, pl.size[1] as f32],
+                uv: [pl.src[0] as f32 / iw as f32, pl.src[1] as f32 / ih as f32],
+                uv_size: [pl.src[2] as f32 / iw as f32, pl.src[3] as f32 / ih as f32],
+                color: [1.0; 4],
+                kind: 2,
+                _pad: 0,
+            });
+        }
+        // The composite quad of a shader chain goes last.
+        p.instances.push(Inst { pos: [0.0, 0.0], size: [rect[2], rect[3]], uv: [0.0, 0.0], uv_size: [1.0, 1.0], color: [1.0; 4], kind: 3, _pad: 0 });
+
+        // Upload: glyphs, new images, the list.
+        let gpu = self.gpu.as_mut().unwrap();
+        for (s, data) in self.atlas.uploads.drain(..) {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: if s.color { &gpu.color_tex } else { &gpu.atlas_tex },
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x: s.x, y: s.y, z: 0 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &data,
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(s.w * if s.color { 4 } else { 1 }), rows_per_image: None },
+                wgpu::Extent3d { width: s.w, height: s.h, depth_or_array_layers: 1 },
+            );
+        }
+        for (image, generation, w, h, px) in p.pending.drain(..) {
+            let bind = gpu.image(device, queue, w, h, &px);
+            self.textures.insert((id, image), ImageTex { generation, size: (w, h), bind });
+        }
+        let live: Vec<u32> = p.placements.iter().map(|pl| pl.image).collect();
+        self.textures.retain(|(pane, image), _| *pane != id || live.contains(image));
+        if p.instances.len() > p.cap {
+            p.cap = p.instances.len().next_power_of_two();
+            p.buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("runeterm cells"),
+                size: (p.cap * std::mem::size_of::<Inst>()) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        queue.write_buffer(&p.buf, 0, bytemuck::cast_slice(&p.instances));
+        p.prepared = true;
+        self.panes.insert(id, p);
+        true
+    }
+
+    /// Draws a pane's images, backgrounds and text (and cursor) into an open pass.
+    fn draw_layers(&self, pass: &mut wgpu::RenderPass<'_>, id: u32, p: &PaneGpu, gpu: &Gpu) {
+        let images = |pass: &mut wgpu::RenderPass<'_>, layer: Layer| {
+            for &(l, i, image) in &p.image_draws {
+                if l == layer {
+                    if let Some(t) = self.textures.get(&(id, image)) {
+                        pass.set_bind_group(1, &t.bind, &[]);
+                        pass.draw(0..6, i..i + 1);
+                    }
+                }
+            }
+        };
+        images(pass, Layer::BelowBackground);
+        pass.set_bind_group(1, &gpu.no_image, &[]);
+        pass.draw(0..6, 0..p.body_bg as u32);
+        images(pass, Layer::BelowText);
+        pass.set_bind_group(1, &gpu.no_image, &[]);
+        pass.draw(0..6, p.body_bg as u32..p.text_end);
+        images(pass, Layer::AboveText);
+    }
+
+    /// Renders a pane offscreen and runs the shader chain over it.
+    fn run_chain(&mut self, encoder: &mut wgpu::CommandEncoder, device: &wgpu::Device, queue: &wgpu::Queue, id: u32, focused: bool) {
+        let gpu = self.gpu.as_mut().unwrap();
+        let Some(p) = self.panes.get(&id) else { return };
+        let Some(site) = p.site else { return };
+        let size = (site.rect[2].round().max(1.0) as u32, site.rect[3].round().max(1.0) as u32);
+        if p.offscreen.as_ref().map(|o| o.size) != Some(size) {
+            let off = gpu.offscreen(device, size);
+            self.panes.get_mut(&id).unwrap().offscreen = Some(off);
+        }
+        let gpu = self.gpu.as_mut().unwrap();
+        gpu.pipeline(device, shader::FORMAT);
+        let gpu = self.gpu.as_ref().unwrap();
+        let p = self.panes.get(&id).unwrap();
+        let off = p.offscreen.as_ref().unwrap();
+
+        // The grid, upside down (Shadertoy's y points up), on the terminal's background as
+        // Ghostty gives it to shaders, but at 0.8 alpha: effect shaders see the real colour,
+        // and cursor shaders can still tell text (alpha 1) from background.
+        let lin = |v: u8| {
+            let c = v as f64 / 255.0;
+            if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+        };
+        const BG_ALPHA: f64 = 0.8;
+        let b = self.theme.bg;
+        let bg_clear = wgpu::Color { r: lin(b.0) * BG_ALPHA, g: lin(b.1) * BG_ALPHA, b: lin(b.2) * BG_ALPHA, a: BG_ALPHA };
+        let u = Uniforms {
+            origin: [0.0; 4],
+            target: [size.0 as f32, size.1 as f32, 0.0, 0.0],
+            clip: [-1e6, -1e6, 1e6, 1e6],
+            fade: [0; 4],
+            flags: [0, 1, 0, 0],
+        };
+        queue.write_buffer(&p.off_u, 0, bytemuck::bytes_of(&u));
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("runeterm grid offscreen"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &off.views[0],
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(bg_clear), store: wgpu::StoreOp::Store },
+                })],
+                ..Default::default()
+            });
+            pass.set_pipeline(gpu.pipelines.get(&shader::FORMAT).unwrap());
+            pass.set_bind_group(0, &p.off_bind, &[]);
+            pass.set_vertex_buffer(0, p.buf.slice(..));
+            self.draw_layers(&mut pass, id, p, gpu);
+        }
+
+        // Ghostty's uniforms, in pane pixels with y up.
+        let h = size.1 as f32;
+        let up = |r: [f32; 4]| [r[0], h - r[1], r[2], r[3]];
+        let lin = |c: Rgb| [c.0 as f32 / 255.0, c.1 as f32 / 255.0, c.2 as f32 / 255.0, 1.0];
+        let t = &self.theme;
+        let g = shader::Globals {
+            res: [size.0 as f32, h, 1.0, 0.0],
+            time: [self.time as f32, 1.0 / 60.0, 60.0, p.cursor_changed as f32],
+            ints: [self.frame, p.cursor_style, p.cursor_prev_style, p.cursor.is_some_and(|c| c.visible) as i32],
+            focus: [0.0, focused as i32 as f32, 0.0, 0.0],
+            cursor: up(p.cursor_rect),
+            prev_cursor: up(p.cursor_prev),
+            cursor_color: lin(t.cursor),
+            prev_cursor_color: lin(t.cursor),
+            bg: lin(t.bg),
+            fg: lin(t.fg),
+            cursor_rgb: lin(t.cursor),
+            cursor_text: lin(t.bg),
+            sel_fg: lin(t.fg),
+            sel_bg: lin(Rgb(0x3b, 0x4a, 0x63)),
+            ..Default::default()
+        };
+        queue.write_buffer(&off.globals, 0, bytemuck::bytes_of(&g));
+        let chain = gpu.chain.as_ref().unwrap();
+        let mut src = 0;
+        for pipeline in &chain.pipelines {
+            let dst = 1 - src;
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("runeterm custom shader"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &off.views[dst],
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+                })],
+                ..Default::default()
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &off.reads[src], &[]);
+            pass.draw(0..3, 0..1);
+            src = dst;
+        }
+        self.panes.get_mut(&id).unwrap().offscreen.as_mut().unwrap().result = src;
+    }
+}
+
+impl Compositor<State> for GridRenderer {
+    fn render(&mut self, f: &mut RuneFrame<'_, State>) {
+        if crate::config::generation() != self.generation {
+            self.generation = crate::config::generation();
+            if let Some(c) = crate::config::published() {
+                self.reload(&c);
+            }
+        }
+        let key = f.device_key();
+        if self.gpu.as_ref().map(|g| g.key) != Some(key) {
+            self.gpu = Some(Gpu::new(f.device, key, &self.shaders));
+            self.atlas = Atlas::new();
+            self.metrics = None;
+            self.panes.clear();
+            self.textures.clear();
+        }
+        let dt = (f.dt as f32).clamp(0.0, 0.1);
+        self.time += f.dt.clamp(0.0, 0.1);
+        self.frame += 1;
+        self.moving = false;
+        let clear = f.rt.clear_color();
+        f.ui.prepare(f.device, f.queue, &mut f.rt.text.atlas, &f.rt.instances, f.size);
+
+        let (device, queue) = (f.device, f.queue);
+        let state = &f.rt.state;
+        let focused = state.focused_id();
+        let shaders = self.gpu.as_ref().is_some_and(|g| g.chain.is_some());
+
+        // Panes drawn last frame: update them, and run their shaders, before the frame's pass.
+        for p in self.panes.values_mut() {
+            p.prepared = false;
+        }
+        // Only the ones on screen last frame: a hidden tab's panes keep their GPU state (so
+        // coming back to them is instant) but cost nothing while hidden.
+        let known: Vec<(u32, Site)> = self
+            .panes
+            .iter()
+            .filter(|(id, _)| self.last_seen.contains(id))
+            .filter_map(|(id, p)| p.site.map(|s| (*id, s)))
+            .collect();
+        for (id, site) in known {
+            if self.prepare(state, id, site, device, queue, dt) && shaders {
+                self.run_chain(f.encoder, device, queue, id, focused == Some(id));
+            }
+        }
+
+        let mut seen = Vec::new();
+        let mut fresh = false;
+        f.ui.draw_with(f.encoder, f.target, clear, &mut |pass, site: &EffectSite<'_>| {
+            let id = site.mark;
+            let r = site.instance.rect;
+            let here = Site { rect: r, scale: site.scale };
+            // A pane new this frame is drawn directly; from the next frame on it goes through
+            // its shaders.
+            let moved = self.panes.get(&id).and_then(|p| p.site).is_none_or(|s| s.rect != r || s.scale != site.scale);
+            let ready = self.panes.get(&id).is_some_and(|p| p.prepared);
+            if !ready {
+                if !self.prepare(state, id, here, device, queue, dt) {
+                    return;
+                }
+                fresh = true;
+            } else if let Some(p) = self.panes.get_mut(&id) {
+                p.site = Some(here);
+            }
+            fresh |= moved;
+            seen.push(id);
+            let gpu = self.gpu.as_mut().unwrap();
+            gpu.pipeline(device, site.format);
+            let gpu = self.gpu.as_ref().unwrap();
+            let p = self.panes.get(&id).unwrap();
+            let u = Uniforms {
+                origin: [r[0] - site.origin[0], r[1] - site.origin[1], site.origin[0], site.origin[1]],
+                target: [site.size[0] as f32, site.size[1] as f32, 0.0, 0.0],
+                clip: site.instance.clip,
+                fade: site.instance.fade,
+                flags: [site.srgb_blend as u32, 0, 0, 0],
+            };
+            queue.write_buffer(&p.slot_u, 0, bytemuck::bytes_of(&u));
+            pass.set_pipeline(gpu.pipelines.get(&site.format).unwrap());
+            pass.set_bind_group(0, &p.slot_bind, &[]);
+            pass.set_vertex_buffer(0, p.buf.slice(..));
+            match (&p.offscreen, shaders) {
+                // The shader's result, even while the slot is mid-animation and its size is a
+                // frame behind: stretching it is invisible, falling back to the plain grid is not.
+                (Some(off), true) if ready => {
+                    let last = p.instances.len() as u32 - 1;
+                    pass.set_bind_group(1, &off.shows[off.result], &[]);
+                    pass.draw(0..6, last..last + 1);
+                }
+                // Shown for the first time this frame: its shaders run from the next one. It's
+                // still fading in, so drawing nothing beats a frame without the shader.
+                (_, true) => {}
+                (_, false) => self.draw_layers(pass, id, p, gpu),
+            }
+        });
+        // Panes that still exist keep their GPU state, visible or not.
+        self.panes.retain(|id, _| state.panes.contains_key(id));
+        self.textures.retain(|(pane, _), _| state.panes.contains_key(pane));
+        self.last_seen = seen;
+        let animate_shaders = shaders
+            && match self.shader_animation {
+                ShaderAnimation::Off => false,
+                ShaderAnimation::Focused => focused.is_some(),
+                ShaderAnimation::Always => true,
+            };
+        // Shaders without continuous animation still get a second to play out a change.
+        let recent = self.panes.values().any(|p| self.time - p.cursor_changed < 1.0);
+        self.moving |= fresh || animate_shaders || (shaders && recent);
+    }
+
+    fn animating(&self) -> bool {
+        self.moving
+    }
+}

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=runeterm
+GenericName=Terminal
+Comment=A terminal built on Rune and libghostty-vt
+Exec=sh -c "exec \\$HOME/.local/bin/runeterm"
+Icon=runeterm
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=terminal;shell;tty;
+StartupWMClass=runeterm
