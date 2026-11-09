@@ -52,18 +52,27 @@ fn set(gpa: std.mem.Allocator, pane: u32, index: animals.Index) !void {
     gpa.free(name);
 }
 
-/// Two lines: every animal with the selected one highlighted, then its
-/// name and the keys. The cursor is left at the start of the first line.
+/// How many glyphs show at once; the strip scrolls with the selection so it
+/// fits a narrow terminal (each emoji is two columns wide).
+const visible = 11;
+
+/// Two lines: a strip of animals around the selected one, highlighted, then
+/// its name and the keys. The cursor is left at the start of the first line.
 fn draw(selected: animals.Index) !void {
     var buf: [1024]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try w.writeAll("\r\x1b[2K ");
-    for (animals.all, 0..) |a, i| {
+    const n = animals.all.len;
+    const first = @min(@as(usize, selected) -| visible / 2, n -| visible);
+    const last = @min(first + visible, n);
+    try w.writeAll(if (first > 0) "\x1b[2m‹\x1b[22m" else " ");
+    for (animals.all[first..last], first..) |a, i| {
         if (i == selected)
             try w.print("\x1b[7m {s} \x1b[27m", .{a.glyph})
         else
             try w.print(" {s} ", .{a.glyph});
     }
+    try w.writeAll(if (last < n) "\x1b[2m›\x1b[22m" else " ");
     try w.print("\r\n\x1b[2K  {s}  \x1b[2m←/→ choose · enter keep · esc cancel\x1b[22m\x1b[1A\r", .{
         animals.all[selected].name,
     });

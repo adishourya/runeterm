@@ -2,8 +2,9 @@
 //!
 //! A session gets a random one when it's created and keeps it, so it
 //! survives restarts and is the same in every window. `spooky animal`
-//! changes it. The glyphs are monochrome Nerd Font (Material Design) icons,
-//! so ghostty's CSS can color them.
+//! changes it. The glyphs are colour emoji: animals, then sports. The first
+//! sixteen keep the order the old Nerd Font icons had, so saved sessions keep
+//! their animal.
 
 const std = @import("std");
 const c = @import("c");
@@ -14,22 +15,59 @@ pub const Animal = struct {
 };
 
 pub const all = [_]Animal{
-    .{ .name = "paw", .glyph = "\u{F03E9}" },
-    .{ .name = "dog", .glyph = "\u{F0A43}" },
-    .{ .name = "cat", .glyph = "\u{F011B}" },
-    .{ .name = "rabbit", .glyph = "\u{F0907}" },
-    .{ .name = "owl", .glyph = "\u{F03D2}" },
-    .{ .name = "panda", .glyph = "\u{F03DA}" },
-    .{ .name = "penguin", .glyph = "\u{F0EC0}" },
-    .{ .name = "turtle", .glyph = "\u{F0CD7}" },
-    .{ .name = "duck", .glyph = "\u{F01E5}" },
-    .{ .name = "elephant", .glyph = "\u{F07C6}" },
-    .{ .name = "koala", .glyph = "\u{F173F}" },
-    .{ .name = "bird", .glyph = "\u{F15C6}" },
-    .{ .name = "jellyfish", .glyph = "\u{F0F01}" },
-    .{ .name = "bee", .glyph = "\u{F0FA1}" },
-    .{ .name = "dolphin", .glyph = "\u{F18B4}" },
-    .{ .name = "snail", .glyph = "\u{F1677}" },
+    .{ .name = "paw", .glyph = "🐾" },
+    .{ .name = "dog", .glyph = "🐶" },
+    .{ .name = "cat", .glyph = "🐱" },
+    .{ .name = "rabbit", .glyph = "🐰" },
+    .{ .name = "owl", .glyph = "🦉" },
+    .{ .name = "panda", .glyph = "🐼" },
+    .{ .name = "penguin", .glyph = "🐧" },
+    .{ .name = "turtle", .glyph = "🐢" },
+    .{ .name = "duck", .glyph = "🦆" },
+    .{ .name = "elephant", .glyph = "🐘" },
+    .{ .name = "koala", .glyph = "🐨" },
+    .{ .name = "bird", .glyph = "🐦" },
+    .{ .name = "jellyfish", .glyph = "🪼" },
+    .{ .name = "bee", .glyph = "🐝" },
+    .{ .name = "dolphin", .glyph = "🐬" },
+    .{ .name = "snail", .glyph = "🐌" },
+    .{ .name = "fox", .glyph = "🦊" },
+    .{ .name = "tiger", .glyph = "🐯" },
+    .{ .name = "lion", .glyph = "🦁" },
+    .{ .name = "frog", .glyph = "🐸" },
+    .{ .name = "octopus", .glyph = "🐙" },
+    .{ .name = "unicorn", .glyph = "🦄" },
+    .{ .name = "whale", .glyph = "🐳" },
+    .{ .name = "hedgehog", .glyph = "🦔" },
+    .{ .name = "sloth", .glyph = "🦥" },
+    .{ .name = "otter", .glyph = "🦦" },
+    .{ .name = "parrot", .glyph = "🦜" },
+    .{ .name = "crab", .glyph = "🦀" },
+    .{ .name = "butterfly", .glyph = "🦋" },
+    .{ .name = "dino", .glyph = "🦕" },
+    .{ .name = "monkey", .glyph = "🐵" },
+    .{ .name = "shark", .glyph = "🦈" },
+    .{ .name = "soccer", .glyph = "⚽" },
+    .{ .name = "basketball", .glyph = "🏀" },
+    .{ .name = "football", .glyph = "🏈" },
+    .{ .name = "baseball", .glyph = "⚾" },
+    .{ .name = "tennis", .glyph = "🎾" },
+    .{ .name = "volleyball", .glyph = "🏐" },
+    .{ .name = "rugby", .glyph = "🏉" },
+    .{ .name = "pingpong", .glyph = "🏓" },
+    .{ .name = "badminton", .glyph = "🏸" },
+    .{ .name = "hockey", .glyph = "🏒" },
+    .{ .name = "cricket", .glyph = "🏏" },
+    .{ .name = "golf", .glyph = "⛳" },
+    .{ .name = "boxing", .glyph = "🥊" },
+    .{ .name = "bowling", .glyph = "🎳" },
+    .{ .name = "pool", .glyph = "🎱" },
+    .{ .name = "darts", .glyph = "🎯" },
+    .{ .name = "surf", .glyph = "🏄" },
+    .{ .name = "bike", .glyph = "🚴" },
+    .{ .name = "ski", .glyph = "🎿" },
+    .{ .name = "trophy", .glyph = "🏆" },
+    .{ .name = "medal", .glyph = "🥇" },
 };
 
 /// An index into `all`.
@@ -55,7 +93,8 @@ pub fn splitName(payload: []const u8) struct { name: []const u8, animal: []const
 
 test "find and splitName" {
     try std.testing.expectEqual(@as(?Index, 0), find("paw"));
-    try std.testing.expectEqual(@as(?Index, null), find("unicorn"));
+    try std.testing.expectEqual(@as(?Index, null), find("dragonfly"));
+    try std.testing.expectEqual(@as(?Index, 2), find("cat"));
     const both = splitName("work\x00owl");
     try std.testing.expectEqualStrings("work", both.name);
     try std.testing.expectEqualStrings("owl", both.animal);

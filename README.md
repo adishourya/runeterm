@@ -99,9 +99,10 @@ setopt prompt_subst
 RPROMPT='${SPOOKY_SESSION:+[$SPOOKY_ANIMAL $SPOOKY_SESSION]}'
 ```
 
-**Animals:** each session also shows a little animal before its name, a
-Nerd Font icon you can color with `.spooky-animal`. A new session gets a
-random one and keeps it, across restarts and in every window. To choose:
+**Animals:** each session also shows a little emoji before its name: an
+animal or a sport (it needs a colour emoji font, such as Noto Color Emoji).
+A new session gets a random one and keeps it, across restarts and in every
+window. To choose:
 
 ```sh
 spooky animal              # inside a pane: pick with ←/→ (or h/l), Enter keeps,
@@ -142,6 +143,12 @@ Shells killed during shutdown slightly before the daemon (within 5s) are
 kept rather than forgotten. Panes killed by a signal are always kept.
 
 ## Design notes
+
+- **Several controllers**: ghostty and any number of runeterm processes can
+  connect as controllers at once. Each reports its own windows, and the
+  daemon matches every window to a session across all of them. An `open`
+  sent by a controller comes back to that controller, so a window can take
+  over a session.
 
 - **Hot path**: read pty, write socket, nothing else. VT parsing is deferred
   until the pane has been quiet for 15ms, or done right away while detached
