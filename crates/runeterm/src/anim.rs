@@ -6,17 +6,18 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 /// An animation being played: an image per frame (Rune doesn't redraw an image replaced in
-/// place, so each frame is its own), and the frame showing.
+/// place, so each frame is its own), the frame showing, and the one it rests on.
 struct Playing {
     frames: Vec<rune::Pixels>,
     shown: usize,
-    /// When it started playing: it starts from its first frame, as the still shows.
+    rest: usize,
+    /// When it started playing: it starts from its resting frame, as the still shows.
     start: Option<f64>,
 }
 
-/// Decoded only while on screen (`tick` lets go of the rest): a minute of frames is megabytes.
+/// Decoded only while playing (`tick` lets go of the rest): a minute of frames is megabytes.
 static PLAYERS: Mutex<Option<HashMap<&'static str, Playing>>> = Mutex::new(None);
-/// Each animal's first frame, for the emoji grid: small, and kept.
+/// Each animal's resting frame, shown while it stands still: small, and kept.
 static STILLS: Mutex<Option<HashMap<&'static str, rune::Pixels>>> = Mutex::new(None);
 
 /// spooky's emoji for each animal name, from `spooky animal --list`, looked up once.
@@ -31,12 +32,27 @@ pub fn find(animal: &str) -> Option<&'static Anim> {
     ALL.iter().find(|a| a.name == name)
 }
 
+/// How long one play through `anim` takes, in seconds.
+pub fn duration(anim: &Anim) -> f64 {
+    anim.frames as f64 / anim.fps.max(1.0) as f64
+}
+
+/// The frame an animal rests on: the first one well drawn (some animations fade or swim in
+/// from nothing).
+fn rest(frames: &[Vec<u8>]) -> usize {
+    let ink: Vec<usize> = frames.iter().map(|f| f.chunks(4).filter(|p| p[3] > 32).count()).collect();
+    let most = ink.iter().copied().max().unwrap_or(0);
+    ink.iter().position(|&n| n * 10 >= most * 6).unwrap_or(0)
+}
+
 /// The image of `anim` playing, and the frame it shows. Its frames are decoded the first time
 /// it's asked for; `tick` moves it on.
 pub fn frame(anim: &'static Anim) -> (rune::Pixels, usize) {
     let mut players = PLAYERS.lock().unwrap();
     let p = players.get_or_insert_with(HashMap::new).entry(anim.name).or_insert_with(|| {
-        let frames = decode(anim)
+        let raw = decode(anim);
+        let rest = rest(&raw);
+        let frames = raw
             .into_iter()
             .map(|f| {
                 let px = rune::Pixels::new();
@@ -44,12 +60,12 @@ pub fn frame(anim: &'static Anim) -> (rune::Pixels, usize) {
                 px
             })
             .collect();
-        Playing { frames, shown: 0, start: None }
+        Playing { frames, shown: rest, rest, start: None }
     });
     (p.frames.get(p.shown).cloned().unwrap_or_default(), p.shown)
 }
 
-/// `anim`'s first frame, standing still.
+/// `anim` standing still, on its resting frame.
 pub fn still(anim: &'static Anim) -> rune::Pixels {
     let mut stills = STILLS.lock().unwrap();
     stills
@@ -57,8 +73,10 @@ pub fn still(anim: &'static Anim) -> rune::Pixels {
         .entry(anim.name)
         .or_insert_with(|| {
             let pixels = rune::Pixels::new();
-            if let Some(f) = decode(anim).into_iter().next() {
-                pixels.set(anim.size, anim.size, f);
+            let mut frames = decode(anim);
+            let i = rest(&frames);
+            if i < frames.len() {
+                pixels.set(anim.size, anim.size, frames.swap_remove(i));
             }
             pixels
         })
@@ -66,8 +84,8 @@ pub fn still(anim: &'static Anim) -> rune::Pixels {
 }
 
 /// Moves each of `playing` to its frame due at `t` (seconds), and lets go of the animations no
-/// longer on screen. Returns whether any frame changed (the view then shows it), and
-/// the time until the next.
+/// longer playing. Returns whether any frame changed (the view then shows it), and the time
+/// until the next.
 pub fn tick(t: f64, playing: &[&'static Anim]) -> (bool, Option<f64>) {
     let mut players = PLAYERS.lock().unwrap();
     let Some(players) = players.as_mut() else { return (false, None) };
@@ -76,7 +94,7 @@ pub fn tick(t: f64, playing: &[&'static Anim]) -> (bool, Option<f64>) {
     for anim in playing {
         let Some(p) = players.get_mut(anim.name) else { continue };
         let pos = (t - *p.start.get_or_insert(t)) * anim.fps as f64;
-        let i = pos.floor() as usize % p.frames.len().max(1);
+        let i = (p.rest + pos.floor() as usize) % p.frames.len().max(1);
         changed |= i != p.shown;
         p.shown = i;
         let until = (pos.floor() + 1.0 - pos) / anim.fps as f64;
@@ -122,6 +140,8 @@ mod tests {
             assert!(frames.iter().all(|f| f.len() == (a.size * a.size * 4) as usize), "{}", a.name);
             // Not blank: some frame has visible pixels.
             assert!(frames.iter().any(|f| f.chunks(4).any(|p| p[3] > 0)), "{} is empty", a.name);
+            // It rests on a frame with something on it.
+            assert!(frames[rest(&frames)].chunks(4).any(|p| p[3] > 32), "{} rests on nothing", a.name);
         }
     }
 }

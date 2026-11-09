@@ -25,3 +25,14 @@ Free animations from [LottieFiles](https://lottiefiles.com), under the [Lottie S
 | parrot | https://assets-v2.lottiefiles.com/a/03186578-1188-11ee-b7cc-5ba3071df800/QtDl58qr3v.lottie |
 | snail | https://assets-v2.lottiefiles.com/a/4cc3d82e-cca9-11ee-bb37-7367fde7044f/qDoYWoy3u2.lottie |
 | butterfly | https://assets-v2.lottiefiles.com/a/21b77e16-1173-11ee-83bc-dba7bd741e65/xN7J9BamlU.lottie |
+| fox | https://lottiefiles.com/free-animation/1521160 (resting fox) |
+| frog | https://lottiefiles.com/free-animation/96002 (Cute Froggy Looking Around) |
+| octopus | https://lottiefiles.com/free-animation/140656 (Little cute octopus) |
+| otter | https://lottiefiles.com/free-animation/1502841 (Cute seal) |
+| penguin | https://lottiefiles.com/free-animation/138336 (Penguin) |
+| tiger | https://lottiefiles.com/free-animation/74268 (Cute Tiger) |
+| duck | https://lottiefiles.com/free-animation/99166 (duck) |
+| jellyfish | https://lottiefiles.com/free-animation/14411 (Jellyfish greeting you!) |
+| paw | https://lottiefiles.com/free-animation/75411 (dog paws) |
+| shark | https://lottiefiles.com/free-animation/101830 (shark) |
+| whale | https://lottiefiles.com/free-animation/57203 (WHALE — Orca Collectible) |

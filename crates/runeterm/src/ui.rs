@@ -395,7 +395,7 @@ fn session_hue(_: &State) -> Color {
 fn badge(s: &State, size: f32) -> El {
     let c = session_hue(s);
     let face = match &s.session {
-        Some(sess) if !sess.animal.is_empty() => animal(&sess.animal, size * 0.8, size * 0.54, hovered(s, &sess.animal)),
+        Some(sess) if !sess.animal.is_empty() => animal(&sess.animal, size * 0.8, size * 0.54, s.animal_playing(&sess.animal)),
         _ => icon(&icons::TERMINAL, size * 0.46).color(c),
     };
     el().key("session-badge").size(size, size).radius(size * 0.32).center()
@@ -412,7 +412,7 @@ fn badge(s: &State, size: f32) -> El {
         .child(face)
 }
 
-/// A session's animal: its animation's first frame, playing while `playing` (hovered), or its
+/// A session's animal: its animation's resting frame, playing while `playing`, or its
 /// emoji when there's no animation of it.
 fn animal(emoji: &str, size: f32, font: f32, playing: bool) -> El {
     match crate::anim::find(emoji) {
@@ -439,9 +439,6 @@ fn plays_on_hover(emoji: String) -> impl Fn(&mut State, bool, &mut Tx) + 'static
     }
 }
 
-fn hovered(s: &State, emoji: &str) -> bool {
-    s.hovered_animal.as_deref() == Some(emoji)
-}
 
 fn session_name(s: &State) -> String {
     match (&s.session, s.uses_spooky()) {
@@ -728,7 +725,7 @@ fn session_list(s: &State, sessions: &[crate::spooky::SessionInfo], mode: &Picke
             .help("Change emoji")
             .on_press(move |s: &mut State| s.choose_emoji(&emoji))
             .on_hover_change(plays_on_hover(info.animal.clone()))
-            .child(animal(&info.animal, 30.0, 19.0, hovered(s, &info.animal)));
+            .child(animal(&info.animal, 30.0, 19.0, s.animal_playing(&info.animal)));
         let trash = el().key(format!("picker-kill-{}", info.name)).size(28.0, 28.0).radius(8.0).center()
             .hover(look::attention().alpha(0.16)).cursor(Cursor::Pointer)
             .help("Kill session")
@@ -792,7 +789,7 @@ fn emoji_grid(s: &State, sessions: &[crate::spooky::SessionInfo], session: &str,
                 .help(name.clone())
                 .on_press(move |s: &mut State| s.set_emoji(&session, &name))
                 .on_hover_change(plays_on_hover(glyph.clone()))
-                .child(animal(glyph, 34.0, 22.0, hovered(s, glyph)));
+                .child(animal(glyph, 34.0, 22.0, s.animal_playing(glyph)));
             if chosen {
                 cell = cell.fill(look::busy().alpha(0.14)).border(1.5, look::busy().alpha(0.7));
             }
@@ -809,7 +806,7 @@ fn emoji_grid(s: &State, sessions: &[crate::spooky::SessionInfo], session: &str,
     let mut c = col().w_full().gap(10.0).p_all(2.0)
         .child(row().h(32.0).gap(8.0).items_center()
             .child(back)
-            .child(animal(&current, 26.0, 18.0, hovered(s, &current)))
+            .child(animal(&current, 26.0, 18.0, s.animal_playing(&current)))
             .child(text(format!("Emoji for {session}")).font(TITLE).color(look::text()).single_line().truncate()));
     if animals.is_empty() {
         return c.child(text("spooky didn't list any emoji").font(SMALL).color(look::faint()).px(4.0));
@@ -915,7 +912,9 @@ pub fn spec() -> AppSpec<State> {
             // The clock and battery change on their own: look again every few seconds, or at
             // the next frame of an animal on screen.
             let (moved, next) = crate::anim::tick(t, &s.animals_on_screen());
-            tx.wake_after(std::time::Duration::from_secs_f64(next.unwrap_or(5.0).clamp(1.0 / 120.0, 5.0)));
+            // At the next frame of an animal playing, else for the next play-through.
+            let next = next.unwrap_or_else(|| s.next_wave_in()).min(5.0);
+            tx.wake_after(std::time::Duration::from_secs_f64(next.max(1.0 / 120.0)));
             changed || moved
         }),
         on_key: Some(|s, e, tx: &mut Tx| s.key(e, tx)),

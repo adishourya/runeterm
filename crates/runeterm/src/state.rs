@@ -103,6 +103,11 @@ pub struct State {
     pub session: Option<Session>,
     /// The animal under the pointer: the only one that plays.
     pub hovered_animal: Option<String>,
+    /// The app's clock at the last poll, for what plays.
+    now: f64,
+    /// The last play-through of the resting animals (see `step_wave`).
+    wave_start: f64,
+    wave_end: f64,
     /// The session whose emoji was last checked for an animation (see `give_mascot`).
     mascot_checked: Option<String>,
     /// Wheel movement not yet a whole line, by pane, in lines.
@@ -191,6 +196,10 @@ impl State {
             accent_for: None,
             session: None,
             hovered_animal: None,
+            now: 0.0,
+            // None yet: the first is WAVE_EVERY seconds in.
+            wave_start: f64::NEG_INFINITY,
+            wave_end: 0.0,
             mascot_checked: None,
             wheel_rest: HashMap::new(),
             window_focused: true,
@@ -451,6 +460,7 @@ impl State {
         let mut changed = false;
         changed |= self.handle_events();
         changed |= self.follow_session_accent();
+        changed |= self.step_wave(t);
         self.give_mascot();
         let exited: Vec<u32> = self.panes.values().filter(|p| p.exited.load(Ordering::Acquire)).map(|p| p.id).collect();
         for id in exited {
@@ -603,9 +613,66 @@ impl State {
         }
     }
 
-    /// The animals to play: only the one under the pointer.
+    /// The animals that play through now and then: the session's own, and the picker's
+    /// sessions while it lists them.
+    fn wave_animals(&self) -> Vec<&'static crate::animals::Anim> {
+        let mut out: Vec<&'static crate::animals::Anim> = vec![];
+        let mut add = |emoji: &str| {
+            if let Some(a) = crate::anim::find(emoji) {
+                if !out.iter().any(|o| o.name == a.name) {
+                    out.push(a);
+                }
+            }
+        };
+        if let Some(s) = &self.session {
+            add(&s.animal);
+        }
+        if let (Some(sessions), PickerMode::List) = (&self.picker, &self.picker_mode) {
+            sessions.iter().for_each(|i| add(&i.animal));
+        }
+        out
+    }
+
+    /// Whether `a` is in the middle of the current play-through.
+    fn waving(&self, a: &crate::animals::Anim) -> bool {
+        self.now >= self.wave_start
+            && self.now < self.wave_start + crate::anim::duration(a)
+            && self.wave_animals().iter().any(|w| w.name == a.name)
+    }
+
+    /// Whether the view shows `emoji`'s animal playing: hovered, or in a play-through.
+    pub fn animal_playing(&self, emoji: &str) -> bool {
+        self.hovered_animal.as_deref() == Some(emoji) || crate::anim::find(emoji).is_some_and(|a| self.waving(a))
+    }
+
+    /// The animals playing now: the one under the pointer, and those in a play-through.
     pub fn animals_on_screen(&self) -> Vec<&'static crate::animals::Anim> {
-        self.hovered_animal.as_deref().and_then(crate::anim::find).into_iter().collect()
+        let mut out: Vec<&'static crate::animals::Anim> = self.wave_animals().into_iter().filter(|a| self.waving(a)).collect();
+        if let Some(a) = self.hovered_animal.as_deref().and_then(crate::anim::find) {
+            if !out.iter().any(|o| o.name == a.name) {
+                out.push(a);
+            }
+        }
+        out
+    }
+
+    /// The resting animals play through once, WAVE_EVERY seconds after the last play-through
+    /// ended. Returns whether what plays changed: the view switches between stills and frames.
+    fn step_wave(&mut self, t: f64) -> bool {
+        const WAVE_EVERY: f64 = 10.0;
+        let names = |s: &State| s.animals_on_screen().iter().map(|a| a.name).collect::<Vec<_>>();
+        let before = names(self);
+        self.now = t;
+        if t >= self.wave_end + WAVE_EVERY {
+            self.wave_start = t;
+            self.wave_end = t + self.wave_animals().iter().map(|a| crate::anim::duration(a)).fold(0.0, f64::max);
+        }
+        names(self) != before
+    }
+
+    /// Seconds until the next play-through starts.
+    pub fn next_wave_in(&self) -> f64 {
+        (self.wave_end + 10.0 - self.now).max(0.0)
     }
 
     /// Takes the session's own accent once the session is known (a new one is given a colour no
