@@ -340,6 +340,14 @@ impl Terminal {
         unsafe { sys::ghostty_terminal_scroll_viewport(self.raw, b) };
     }
 
+    /// How far back the viewport is: rows of scrollback above it (0 at the top).
+    pub fn scroll_offset(&self) -> u64 {
+        let mut b = sys::GhosttyTerminalScrollbar { total: 0, offset: 0, len: 0 };
+        // SAFETY: SCROLLBAR writes a GhosttyTerminalScrollbar.
+        unsafe { sys::ghostty_terminal_get(self.raw, sys::GHOSTTY_TERMINAL_DATA_SCROLLBAR, &mut b as *mut _ as *mut c_void) };
+        b.offset
+    }
+
     pub fn scroll_to_bottom(&mut self) {
         let mut b = sys::GhosttyTerminalScrollViewport::default();
         b.tag = sys::GHOSTTY_TERMINAL_SCROLL_VIEWPORT_BOTTOM;

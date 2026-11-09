@@ -872,9 +872,12 @@ pub fn spec() -> AppSpec<State> {
             let _ = WAKER.set(waker);
         }),
         poll: Some(|s, t, tx: &mut Tx| {
-            // The clock and battery change on their own: look again every few seconds.
-            tx.wake_after(std::time::Duration::from_secs(5));
-            s.poll(t)
+            let changed = s.poll(t);
+            // The clock and battery change on their own: look again every few seconds. A pane
+            // scrolling smoothly wants every frame.
+            let next = if s.scrolling() { 1.0 / 120.0 } else { 5.0 };
+            tx.wake_after(std::time::Duration::from_secs_f64(next));
+            changed
         }),
         on_key: Some(|s, e, tx: &mut Tx| s.key(e, tx)),
         scenes: &[
@@ -885,6 +888,12 @@ pub fn spec() -> AppSpec<State> {
                 // A screenful and more of output, to scroll back through.
                 if let Some(p) = s.focused_id().and_then(|id| s.panes.get(&id)) {
                     p.send(b"seq 1 300\n");
+                }
+            }),
+            ("follow", |s| {
+                // Output that goes on after a while, to check the bottom still follows it.
+                if let Some(p) = s.focused_id().and_then(|id| s.panes.get(&id)) {
+                    p.send(b"seq 1 300; sleep 2; seq 301 320\n");
                 }
             }),
             ("animal", |s| {

@@ -60,4 +60,6 @@ spooky too.
 - Mouse: drag to select (twice for a word, three times for a line), Ctrl+Shift+C / Ctrl+Shift+V
   copy and paste, middle-click pastes the selection, Ctrl+click opens links, drag the gap between
   splits to resize them. Programs that use the mouse get it; hold Shift to select instead.
+- Scrolling is smooth: the grid follows a trackpad to the pixel and coasts on after a flick, a
+  mouse wheel's notches glide in (three lines each), and it settles on a whole line.
 - Crashes are logged to `~/.local/state/runeterm/crash.log`.

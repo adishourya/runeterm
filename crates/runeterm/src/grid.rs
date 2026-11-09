@@ -297,6 +297,12 @@ struct PaneGpu {
     /// Cell backgrounds then text, rebuilt when rows change.
     body: Vec<Inst>,
     body_bg: usize,
+    /// While scrolling smoothly: the row above the viewport (drawn at the top of the grid, a
+    /// line up), read through a render state of its own.
+    above_rs: RenderState,
+    above: Option<Row>,
+    /// Where this frame's backgrounds end in `instances`.
+    bg_end: u32,
     placements: Vec<Placement>,
     /// Pixels read under the terminal lock, waiting for a texture.
     pending: Vec<(u32, u64, u32, u32, Vec<u8>)>,
@@ -544,6 +550,9 @@ impl Gpu {
             colors: (Rgb(255, 255, 255), Rgb(0, 0, 0)),
             body: vec![],
             body_bg: 0,
+            above_rs: RenderState::new(),
+            above: None,
+            bg_end: 0,
             placements: vec![],
             pending: vec![],
             instances: vec![],
@@ -824,10 +833,20 @@ impl GridRenderer {
             GEOMETRY.lock().unwrap().get_or_insert_with(HashMap::new).insert(id, g);
         }
         let textures = &self.textures;
+        // Scrolling smoothly: the grid is drawn this much lower, the row above showing on top.
+        let off = (s.scroll_frac(id) * m.h).round();
+        let mut above_frame = None;
         let frame: Frame = {
-            let t = pane.term.lock().unwrap();
+            let mut t = pane.term.lock().unwrap();
             pane.dirty.store(false, Ordering::Release);
             p.rs.begin(&t);
+            if off > 0.0 && t.scroll_offset() > 0 {
+                // The viewport one line back has that row first; then straight back.
+                t.scroll(-1);
+                p.above_rs.begin(&t);
+                t.scroll(1);
+                above_frame = Some(p.above_rs.finish());
+            }
             let frame = p.rs.finish();
             // Pixels are only readable while we hold the terminal: copy the ones we lack.
             if let Some(list) = &frame.images {
@@ -857,6 +876,9 @@ impl GridRenderer {
                 p.rows[y] = self.build_row(m, pad, y, cells, frame.bg);
                 body_changed = true;
             }
+        }
+        if let Some(Some(cells)) = above_frame.as_ref().and_then(|f| f.dirty_rows.first()) {
+            p.above = Some(self.build_row(m, pad, 0, cells, frame.bg));
         }
         if body_changed {
             p.body.clear();
@@ -907,9 +929,20 @@ impl GridRenderer {
 
         // This frame's list: body, cursor, images.
         p.instances.clear();
-        p.instances.extend_from_slice(&p.body);
+        let shift = |i: &Inst, dy: f32| Inst { pos: [i.pos[0], i.pos[1] + dy], ..*i };
+        let above = p.above.as_ref().filter(|_| above_frame.is_some());
+        if let Some(a) = above {
+            p.instances.extend(a.bg.iter().map(|i| shift(i, off - m.h)));
+        }
+        p.instances.extend(p.body[..p.body_bg].iter().map(|i| shift(i, off)));
+        p.bg_end = p.instances.len() as u32;
+        if let Some(a) = above {
+            p.instances.extend(a.fg.iter().map(|i| shift(i, off - m.h)));
+        }
+        p.instances.extend(p.body[p.body_bg..].iter().map(|i| shift(i, off)));
         if c.visible && self.cursor_opacity > 0.0 {
             let [x, y, w, h] = p.cursor_drawn;
+            let y = y + off;
             let col = self.theme.cursor;
             let quad = |pos: [f32; 2], size: [f32; 2], a: f32| Inst { pos, size, color: rgba(col, a * self.cursor_opacity), ..Default::default() };
             match style {
@@ -933,7 +966,7 @@ impl GridRenderer {
                 .or_else(|| p.pending.iter().find(|q| q.0 == pl.image).map(|q| (q.2, q.3)))
                 .unwrap_or((1, 1));
             let x = pad + pl.col as f32 * m.w + pl.offset[0] as f32;
-            let y = pad + pl.row as f32 * m.h + pl.offset[1] as f32;
+            let y = pad + pl.row as f32 * m.h + pl.offset[1] as f32 + off;
             p.image_draws.push((pl.layer, p.instances.len() as u32, pl.image));
             p.instances.push(Inst {
                 pos: [x, y],
@@ -998,10 +1031,10 @@ impl GridRenderer {
         };
         images(pass, Layer::BelowBackground);
         pass.set_bind_group(1, &gpu.no_image, &[]);
-        pass.draw(0..6, 0..p.body_bg as u32);
+        pass.draw(0..6, 0..p.bg_end);
         images(pass, Layer::BelowText);
         pass.set_bind_group(1, &gpu.no_image, &[]);
-        pass.draw(0..6, p.body_bg as u32..p.text_end);
+        pass.draw(0..6, p.bg_end..p.text_end);
         images(pass, Layer::AboveText);
     }
 

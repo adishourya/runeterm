@@ -105,6 +105,10 @@ pub struct State {
     animal_checked: Option<String>,
     /// Wheel movement not yet a whole line, by pane, in lines.
     wheel_rest: HashMap<u32, f32>,
+    /// Smooth scrolling through each pane's scrollback, while it moves.
+    scrollers: HashMap<u32, crate::smooth::Scroller>,
+    /// The app's clock at the last poll (seconds), for scrolling's timing.
+    now: f64,
     /// Whether the window has keyboard focus (for the cursor and shaders' `iFocus`).
     pub window_focused: bool,
     /// The sidebar is expanded (hovered, or the session picker is open).
@@ -190,6 +194,8 @@ impl State {
             session: None,
             animal_checked: None,
             wheel_rest: HashMap::new(),
+            scrollers: HashMap::new(),
+            now: 0.0,
             window_focused: true,
             sidebar_open: false,
             sidebar: config.sidebar,
@@ -352,6 +358,7 @@ impl State {
     /// took it).
     fn forget(&mut self, id: u32) {
         self.wheel_rest.remove(&id);
+        self.scrollers.remove(&id);
         if let (Some(g), Some(p)) = (self.gestures.remove(&id), self.panes.get(&id)) {
             g.free(&p.term.lock().unwrap());
         }
@@ -446,7 +453,9 @@ impl State {
     /// Before each frame: new output, exited shells, and (twice a second) programs and directories.
     pub fn poll(&mut self, t: f64) -> bool {
         let mut changed = false;
+        self.now = t;
         changed |= self.handle_events();
+        changed |= self.step_scrolling();
         changed |= self.follow_session_accent();
         self.give_animal();
         let exited: Vec<u32> = self.panes.values().filter(|p| p.exited.load(Ordering::Acquire)).map(|p| p.id).collect();
@@ -966,6 +975,7 @@ impl State {
             self.keys.encode(&t, key, mods, &text, unshifted)
         };
         term.lock().unwrap().scroll_to_bottom();
+        self.stop_scrolling();
         self.focused_pane().unwrap().send(&bytes);
         true
     }
@@ -974,6 +984,7 @@ impl State {
         if text.is_empty() {
             return;
         }
+        self.stop_scrolling();
         if let Some(p) = self.focused_pane() {
             let bytes = {
                 let mut t = p.term.lock().unwrap();
@@ -989,6 +1000,8 @@ impl State {
         let g = crate::grid::geometry(id)?;
         let (px, py) = (x * g.scale, y * g.scale);
         let col = (((px - g.pad) / g.cell_w).floor().max(0.0) as u16).min(g.cols.saturating_sub(1));
+        // While scrolling, the grid is drawn part of a line lower.
+        let py = py - self.scroll_frac(id) * g.cell_h;
         let row = (((py - g.pad) / g.cell_h).floor().max(0.0) as u16).min(g.rows.saturating_sub(1));
         Some(vt::PointerAt {
             col,
@@ -1095,13 +1108,22 @@ impl State {
     /// The wheel: to the program when it tracks the mouse, else through the scrollback.
     pub fn wheel(&mut self, id: u32, x: f32, y: f32, dy: f32, precise: bool, mods: rune::Mods) {
         let Some(pane) = self.panes.get(&id) else { return };
-        // A trackpad sends many small deltas: keep the part short of a whole line for the next
-        // one, instead of rounding each away.
         let line = crate::grid::geometry(id).map_or(20.0, |g| g.cell_h / g.scale).max(1.0);
-        // A notch of a mouse wheel (Rune's 40 points) is three lines, as in most terminals.
-        let lines = if precise { -dy / line } else { -dy / 40.0 * 3.0 };
+        // Lines back into the scrollback. A notch of a mouse wheel (Rune's 40 points) is three
+        // lines, as in most terminals.
+        let lines = if precise { dy / line } else { dy / 40.0 * 3.0 };
+        let tracking = pane.term.lock().unwrap().mouse_tracking();
+        if !tracking || mods.shift {
+            let s = self.scrollers.entry(id).or_default();
+            match (precise, dy == 0.0) {
+                (true, true) => s.lift(),
+                (true, false) => s.touch(self.now, lines as f64),
+                (false, _) => s.notch(lines as f64),
+            }
+            return;
+        }
+        // To the program, in whole lines: keep the part short of one for the next delta.
         let rest = self.wheel_rest.entry(id).or_insert(0.0);
-        // Turning back drops what was left of the other way.
         if *rest * lines < 0.0 {
             *rest = 0.0;
         }
@@ -1111,19 +1133,62 @@ impl State {
             return;
         }
         *rest -= rows as f32;
-        let tracking = pane.term.lock().unwrap().mouse_tracking();
-        if tracking && !mods.shift {
-            let Some(at) = self.pointer_at(id, x, y) else { return };
-            let vmods = vt::Mods { shift: mods.shift, ctrl: mods.ctrl, alt: mods.alt, logo: mods.logo };
-            let button = if rows < 0 { 4 } else { 5 };
-            let mut bytes = vec![];
-            for _ in 0..rows.unsigned_abs().min(10) {
-                bytes.extend(self.mouse.encode(&pane.term.lock().unwrap(), vt::MouseAction::Press, button, vmods, at));
+        let Some(at) = self.pointer_at(id, x, y) else { return };
+        let vmods = vt::Mods { shift: mods.shift, ctrl: mods.ctrl, alt: mods.alt, logo: mods.logo };
+        let button = if rows > 0 { 4 } else { 5 };
+        let mut bytes = vec![];
+        for _ in 0..rows.unsigned_abs().min(10) {
+            bytes.extend(self.mouse.encode(&pane.term.lock().unwrap(), vt::MouseAction::Press, button, vmods, at));
+        }
+        pane.send(&bytes);
+    }
+
+    /// Moves each scrolling pane on: whole lines move its viewport, the rest offsets its grid.
+    /// Returns whether any moved (to draw).
+    fn step_scrolling(&mut self) -> bool {
+        let t = self.now;
+        let mut moved = false;
+        for (id, s) in self.scrollers.iter_mut() {
+            let Some(pane) = self.panes.get(id) else { continue };
+            let before = s.frac();
+            let n = s.step(t);
+            {
+                let mut term = pane.term.lock().unwrap();
+                if n != 0 {
+                    let from = term.scroll_offset() as i64;
+                    term.scroll(-n as isize);
+                    let went = from - term.scroll_offset() as i64;
+                    if went != n {
+                        s.stop_short(n - went);
+                    }
+                }
+                if term.scroll_offset() == 0 {
+                    s.at_top();
+                }
             }
-            pane.send(&bytes);
-        } else {
-            pane.term.lock().unwrap().scroll(rows);
-            pane.dirty.store(true, Ordering::Release);
+            if n != 0 || s.frac() != before {
+                pane.dirty.store(true, Ordering::Release);
+                moved = true;
+            }
+        }
+        self.scrollers.retain(|_, s| s.active());
+        moved
+    }
+
+    /// Whether a pane is scrolling: frames should keep coming.
+    pub fn scrolling(&self) -> bool {
+        !self.scrollers.is_empty()
+    }
+
+    /// The part of a line pane `id`'s grid is drawn further back than its viewport.
+    pub fn scroll_frac(&self, id: u32) -> f32 {
+        self.scrollers.get(&id).map_or(0.0, |s| s.frac())
+    }
+
+    /// Typing or pasting goes back to the bottom: the focused pane stops scrolling.
+    fn stop_scrolling(&mut self) {
+        if let Some(id) = self.focused_id() {
+            self.scrollers.remove(&id);
         }
     }
 
@@ -1377,3 +1442,4 @@ fn user_host() -> String {
         (true, _) => host,
     }
 }
+

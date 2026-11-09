@@ -1,4 +1,5 @@
 mod accents;
+mod smooth;
 mod bench;
 mod config;
 mod grid;
