@@ -68,14 +68,13 @@ spooky attach -p ID      # attach to one pane (steals it from another view)
 spooky rename [OLD] NEW  # rename a session (default: the current pane's)
 spooky rm NAME...        # delete sessions: end their panes and forget them
 spooky session           # print this pane's session
-spooky animal            # pick this session's animal (see below)
 spooky restart-server    # save everything and restart the daemon, e.g. to upgrade
 spooky kill-server       # stop everything and forget saved state
 ```
 
 **Sessions are windows.** Each session is shown in one Ghostty window. A
-session started without a name gets the next free number (`1`, `2`, ...)
-until you `rename` it. Ghostty reports its layout to the daemon whenever it
+session started without a name gets two random words (`quiet-river`,
+`amber-cove`, ...) until you `rename` it. Ghostty reports its layout to the daemon whenever it
 changes, so `spooky attach work` (also after a reboot) reopens the window
 with the same tabs and splits, at the same ratios. Attaching to a session
 that is already open brings its window to the front.
@@ -84,35 +83,24 @@ that is already open brings its window to the front.
 tab bar, which then stays visible even with a single tab (style it with the
 `.spooky-session` class in `gtk-custom-css`). Shells in a pane get
 `SPOOKY_SESSION` and `SPOOKY_ANIMAL` (the animal's glyph). A later `rename`
-or `animal` can't change a running shell's environment, so to keep a prompt
-current, refresh them before each prompt:
+can't change a running shell's environment, so to keep a prompt current,
+refresh the name before each prompt:
 
 ```zsh
 # ~/.zshrc
 spooky_prompt() {
   [[ -n $SPOOKY_PANE ]] || return
   SPOOKY_SESSION=$(spooky session 2>/dev/null)
-  SPOOKY_ANIMAL=$(spooky animal --glyph 2>/dev/null)
 }
 precmd_functions+=(spooky_prompt)
 setopt prompt_subst
 RPROMPT='${SPOOKY_SESSION:+[$SPOOKY_ANIMAL $SPOOKY_SESSION]}'
 ```
 
-**Animals:** each session also shows a little emoji before its name: an
-animal or a sport (it needs a colour emoji font, such as Noto Color Emoji).
-A new session gets a random one and keeps it, across restarts and in every
-window. To choose:
-
-```sh
-spooky animal              # inside a pane: pick with ←/→ (or h/l), Enter keeps,
-                           # Esc cancels; the tab bar previews each one live
-spooky animal owl          # set this pane's session's animal
-spooky animal work owl     # set another session's
-spooky new work --animal owl
-spooky animal --list       # every animal
-spooky animal --glyph      # this session's animal now, e.g. for a prompt
-```
+**Animals:** each session also shows a little animal emoji before its name
+(it needs a colour emoji font, such as Noto Color Emoji). A new session gets
+a random one and keeps it, across restarts and in every window. A controller
+such as runeterm changes it (there's no command for it).
 
 **Closing:** closing a split or a tab ends its panes. Closing a whole window,
 or quitting Ghostty, only detaches the session. `spooky rm NAME` ends all of

@@ -1,7 +1,7 @@
 //! The animal each session shows beside its name in ghostty's tab bar.
 //!
 //! A session gets a random one when it's created and keeps it, so it
-//! survives restarts and is the same in every window. `spooky animal`
+//! survives restarts and is the same in every window. A controller (runeterm)
 //! changes it. The glyphs are colour emoji: animals, then sports. The first
 //! sixteen keep the order the old Nerd Font icons had, so saved sessions keep
 //! their animal.
@@ -80,9 +80,17 @@ pub fn find(name: []const u8) ?Index {
     return null;
 }
 
+/// A random animal for a new session (not a sport: those follow the animals).
 pub fn random() Index {
-    return @intCast(c.arc4random_uniform(all.len));
+    return @intCast(c.arc4random_uniform(first_sport));
 }
+
+const first_sport: u32 = blk: {
+    for (all, 0..) |x, i| {
+        if (std.mem.eql(u8, x.name, "soccer")) break :blk i;
+    }
+    break :blk all.len;
+};
 
 /// Split a session name from the animal that may follow it after a zero
 /// byte, as `new` and `open` requests send them: "NAME" or "NAME\x00ANIMAL".

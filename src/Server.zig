@@ -510,7 +510,7 @@ fn handleFrame(self: *Server, client: *Client, frame: protocol.Frame) void {
             // With ghostty as the controller, the window the pane shows up
             // in decides its session; a pane outside any session's window
             // starts a new one.
-            var name_buf: [16]u8 = undefined;
+            var name_buf: [48]u8 = undefined;
             if (session.len == 0) session = if (self.controllers.items.len == 0)
                 self.active()
             else

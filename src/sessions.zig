@@ -18,6 +18,7 @@ const protocol = @import("protocol.zig");
 const layout = @import("layout.zig");
 const Server = @import("Server.zig");
 const Pane = @import("Pane.zig");
+const names = @import("names.zig");
 const animals = @import("animals.zig");
 
 const log = std.log.scoped(.sessions);
@@ -63,11 +64,18 @@ pub fn assign(server: *Server, pane: *Pane, name: []const u8) void {
     server.state_dirty = true;
 }
 
-/// The smallest positive number not already used as a session name.
+/// A name no session has yet: two random words ("quiet-river"), with a
+/// number after them if every pair tried is taken. `buf` needs 48 bytes.
 fn autoName(server: *Server, buf: []u8) []const u8 {
-    var n: usize = 1;
+    for (0..50) |_| {
+        const name = names.random(buf);
+        if (find(server, name) == null) return name;
+    }
+    var base_buf: [48]u8 = undefined;
+    const base = names.random(&base_buf);
+    var n: usize = 2;
     while (true) : (n += 1) {
-        const name = std.fmt.bufPrint(buf, "{d}", .{n}) catch unreachable;
+        const name = std.fmt.bufPrint(buf, "{s}-{d}", .{ base, n }) catch unreachable;
         if (find(server, name) == null) return name;
     }
 }
@@ -249,7 +257,7 @@ fn sessionForWindow(server: *Server, window: u64, saved: layout.Saved) ?*Session
     for (saved.tabs) |tab| layout.forEachLeaf(tab, Ctx{ .server = server, .found = &found }, Ctx.leaf);
 
     const session = found orelse session: {
-        var buf: [16]u8 = undefined;
+        var buf: [48]u8 = undefined;
         break :session ensure(server, autoName(server, &buf)) catch return null;
     };
     session.window = window;
@@ -382,7 +390,7 @@ pub fn open(server: *Server, client: *Server.Client, kind: protocol.Prepare.Kind
 
     const split = animals.splitName(name_);
     const animal = animals.find(split.animal);
-    var name_buf: [16]u8 = undefined;
+    var name_buf: [48]u8 = undefined;
     const name = if (split.name.len > 0) split.name else autoName(server, &name_buf);
 
     // Null when the session's window is already open and was raised.
