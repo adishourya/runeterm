@@ -22,6 +22,7 @@ pub mod tag {
     pub const LAYOUT: u8 = 9;
     pub const CLOSED: u8 = 10;
     pub const OPEN: u8 = 11;
+    pub const RENAME: u8 = 12;
     pub const REMOVE: u8 = 13;
     pub const ANIMAL: u8 = 15;
     pub const ATTACHED: u8 = 64;
@@ -215,12 +216,49 @@ pub fn sessions() -> Vec<SessionInfo> {
 /// The animal emojis a session can have, as (glyph, name), in spooky's order (not the sports).
 pub fn animals() -> Vec<(String, String)> {
     let mono = mono_coverage();
-    all_emoji()
-        .into_iter()
-        .take_while(|(_, name)| name != "soccer")
+    ANIMALS
+        .iter()
         .filter(|(glyph, _)| in_colour(glyph, mono))
+        .map(|(glyph, name)| (glyph.to_string(), name.to_string()))
         .collect()
 }
+
+/// spooky's animals, as (glyph, name), in its order (`spooky/src/animals.zig`, before the
+/// sports). spooky has no command to list them; it takes the name to set one.
+const ANIMALS: &[(&str, &str)] = &[
+    ("🐾", "paw"),
+    ("🐶", "dog"),
+    ("🐱", "cat"),
+    ("🐰", "rabbit"),
+    ("🦉", "owl"),
+    ("🐼", "panda"),
+    ("🐧", "penguin"),
+    ("🐢", "turtle"),
+    ("🦆", "duck"),
+    ("🐘", "elephant"),
+    ("🐨", "koala"),
+    ("🐦", "bird"),
+    ("🪼", "jellyfish"),
+    ("🐝", "bee"),
+    ("🐬", "dolphin"),
+    ("🐌", "snail"),
+    ("🦊", "fox"),
+    ("🐯", "tiger"),
+    ("🦁", "lion"),
+    ("🐸", "frog"),
+    ("🐙", "octopus"),
+    ("🦄", "unicorn"),
+    ("🐳", "whale"),
+    ("🦔", "hedgehog"),
+    ("🦥", "sloth"),
+    ("🦦", "otter"),
+    ("🦜", "parrot"),
+    ("🦀", "crab"),
+    ("🦋", "butterfly"),
+    ("🦕", "dino"),
+    ("🐵", "monkey"),
+    ("🦈", "shark"),
+];
 
 /// What fonts without colour glyphs cover, as codepoint ranges, from fontconfig, looked up
 /// once. An emoji one of them covers may be drawn from it, in black and white (DejaVu Sans
@@ -256,21 +294,6 @@ fn in_colour(glyph: &str, mono: &[(u32, u32)]) -> bool {
         .all(|c| !mono.iter().any(|&(a, b)| a <= c && c <= b))
 }
 
-/// Every emoji spooky offers, animals then sports.
-fn all_emoji() -> Vec<(String, String)> {
-    let Ok(out) = std::process::Command::new(binary()).args(["animal", "--list"]).output() else { return vec![] };
-    parse_animals(&String::from_utf8_lossy(&out.stdout))
-}
-
-pub fn parse_animals(text: &str) -> Vec<(String, String)> {
-    text.lines()
-        .filter_map(|l| {
-            let (glyph, name) = l.trim().split_once(' ')?;
-            Some((glyph.to_string(), name.trim().to_string()))
-        })
-        .collect()
-}
-
 /// Sets session `session`'s emoji by name (`Tag.animal`: `Rename{pane}`, the session, a
 /// zero byte, the animal).
 pub fn set_animal(session: &str, animal: &str) -> io::Result<()> {
@@ -279,6 +302,15 @@ pub fn set_animal(session: &str, animal: &str) -> io::Result<()> {
     b.push(0);
     b.extend_from_slice(animal.as_bytes());
     request(tag::ANIMAL, &b).map(|_| ())
+}
+
+/// Renames session `old` to `new` (`spooky rename`; spooky refuses a name that's taken).
+pub fn rename(old: &str, new: &str) -> io::Result<()> {
+    let mut b = 0u32.to_le_bytes().to_vec();
+    b.extend_from_slice(old.as_bytes());
+    b.push(0);
+    b.extend_from_slice(new.as_bytes());
+    request(tag::RENAME, &b).map(|_| ())
 }
 
 /// Ends every pane of session `name` and forgets it (`spooky rm`).
@@ -539,9 +571,12 @@ mod tests {
     }
 
     #[test]
-    fn reads_the_animal_list() {
-        let a = parse_animals("🐾 paw\n🐶 dog\n⚽ soccer\n");
-        assert_eq!(a, vec![("🐾".into(), "paw".into()), ("🐶".into(), "dog".into()), ("⚽".into(), "soccer".into())]);
+    fn the_animals_are_spookys_and_each_once() {
+        assert_eq!(ANIMALS.len(), 32);
+        assert_eq!(ANIMALS[0], ("🐾", "paw"));
+        for (i, (g, n)) in ANIMALS.iter().enumerate() {
+            assert!(ANIMALS[i + 1..].iter().all(|(g2, n2)| g2 != g && n2 != n), "{n} twice");
+        }
     }
 
     #[test]

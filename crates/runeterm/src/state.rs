@@ -26,6 +26,30 @@ pub struct Minimized {
     pub drag_from: Option<(f32, f32)>,
 }
 
+/// A split floating above the others in its tab: dragged by its header, resized from its
+/// corner, docked back where it was.
+pub struct Floating {
+    pub id: u32,
+    pub place: Option<Place>,
+    /// x, y, width, height as fractions of the tab's area.
+    pub rect: [f32; 4],
+    /// The rect when the current drag started.
+    pub drag_from: Option<[f32; 4]>,
+}
+
+impl Floating {
+    /// Moves (or, with `resize`, resizes) it by (`dx`, `dy`) fractions of the tab's area from
+    /// where the drag started, kept inside the tab and no smaller than a fifth of it.
+    pub fn drag(&mut self, dx: f32, dy: f32, resize: bool) {
+        let [x, y, w, h] = self.drag_from.unwrap_or(self.rect);
+        self.rect = if resize {
+            [x, y, (w + dx).clamp(0.2, 1.0 - x), (h + dy).clamp(0.2, 1.0 - y)]
+        } else {
+            [(x + dx).clamp(0.0, 1.0 - w), (y + dy).clamp(0.0, 1.0 - h), w, h]
+        };
+    }
+}
+
 pub struct Tab {
     /// Stable for the tab's life (its view's key, so switching tabs can animate).
     pub id: u32,
@@ -33,18 +57,24 @@ pub struct Tab {
     pub focused: u32,
     pub zoomed: bool,
     pub minimized: Vec<Minimized>,
+    pub floating: Vec<Floating>,
 }
 
 impl Tab {
     /// Every pane of the tab, in layout order, minimized ones last.
     pub fn panes(&self) -> Vec<u32> {
         let mut v = self.root.leaves();
+        v.extend(self.floating.iter().map(|f| f.id));
         v.extend(self.minimized.iter().map(|m| m.id));
         v
     }
 
     pub fn has(&self, id: u32) -> bool {
-        self.root.contains(id) || self.minimized.iter().any(|m| m.id == id)
+        self.root.contains(id) || self.minimized.iter().any(|m| m.id == id) || self.is_floating(id)
+    }
+
+    pub fn is_floating(&self, id: u32) -> bool {
+        self.floating.iter().any(|f| f.id == id)
     }
 }
 
@@ -56,6 +86,24 @@ pub enum PickerMode {
     Emoji { session: String, animals: Vec<(String, String)> },
     /// Asking before ending a session's panes.
     ConfirmKill(String),
+    /// Renaming a session (the new name is typed into `State::rename_edit`), and why the last
+    /// try was refused.
+    Rename { session: String, error: Option<String> },
+}
+
+/// Why `name` can't be a session's name, if it can't.
+pub fn session_name_problem(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        Some("A name can't be empty")
+    } else if name.chars().count() > 32 {
+        Some("At most 32 characters")
+    } else if name.chars().any(|c| c.is_whitespace() || c == '/' || c.is_control()) {
+        Some("No spaces or slashes")
+    } else if name.starts_with('-') {
+        Some("It can't start with a dash")
+    } else {
+        None
+    }
 }
 
 /// The spooky session this window shows.
@@ -103,8 +151,12 @@ pub struct State {
     pub session: Option<Session>,
     /// The session whose emoji was last checked for being an animal (see `give_animal`).
     animal_checked: Option<String>,
+    /// The name being typed while renaming a session.
+    pub rename_edit: rune::TextEdit,
     /// Wheel movement not yet a whole line, by pane, in lines.
     wheel_rest: HashMap<u32, f32>,
+    /// The size of the area the splits are laid out in (points), for floating splits.
+    pub stage: [f32; 2],
     /// Smooth scrolling through each pane's scrollback, while it moves.
     scrollers: HashMap<u32, crate::smooth::Scroller>,
     /// The app's clock at the last poll (seconds), for scrolling's timing.
@@ -119,6 +171,11 @@ pub struct State {
     last_status: f64,
     /// The session picker, when open: every session the daemon knows, and what it shows.
     pub picker: Option<Vec<SessionInfo>>,
+    /// Each listed session's own accent, for the picker's tiles.
+    pub picker_accents: HashMap<String, crate::vt::Rgb>,
+    /// A new window asking which session to be: the picker shows centred, and this is the row
+    /// chosen with the arrow keys (0 is "New session").
+    pub chooser: Option<usize>,
     pub picker_mode: PickerMode,
     /// The daemon connection; None runs panes on local ptys instead.
     controller: Option<Controller>,
@@ -193,8 +250,12 @@ impl State {
             accent_for: None,
             session: None,
             animal_checked: None,
+            rename_edit: rune::TextEdit::new(""),
+            chooser: None,
+            picker_accents: HashMap::new(),
             wheel_rest: HashMap::new(),
             scrollers: HashMap::new(),
+            stage: [1.0, 1.0],
             now: 0.0,
             window_focused: true,
             sidebar_open: false,
@@ -215,6 +276,11 @@ impl State {
         };
         match attach {
             Some(name) if s.controller.is_some() => s.open_session(&name),
+            // Sessions to go back to: ask which (or a new one) first.
+            _ if s.controller.is_some() && spooky::sessions().iter().any(|i| i.state != "open") => {
+                s.picker = Some(s.load_sessions());
+                s.chooser = Some(0);
+            }
             _ => s.new_tab(None),
         }
         s
@@ -286,7 +352,7 @@ impl State {
     pub fn new_tab(&mut self, cwd: Option<String>) {
         if let Some(id) = self.spawn(cwd) {
             let tab = self.tab_id();
-            self.tabs.push(Tab { id: tab, root: Node::Leaf(id), focused: id, zoomed: false, minimized: vec![] });
+            self.tabs.push(Tab { id: tab, root: Node::Leaf(id), focused: id, zoomed: false, minimized: vec![], floating: vec![] });
             self.select_tab(self.tabs.len() - 1);
         }
     }
@@ -370,7 +436,11 @@ impl State {
         let Some(t) = self.tabs.iter().position(|t| t.has(id)) else { return };
         let tab = &mut self.tabs[t];
         tab.minimized.retain(|m| m.id != id);
+        tab.floating.retain(|f| f.id != id);
         if !tab.root.contains(id) {
+            if tab.focused == id {
+                tab.focused = tab.root.first();
+            }
             return;
         }
         match tab.root.remove(id) {
@@ -386,6 +456,11 @@ impl State {
                 if let Some(m) = tab.minimized.pop() {
                     tab.root = Node::Leaf(m.id);
                     tab.focused = m.id;
+                    return;
+                }
+                if let Some(f) = tab.floating.pop() {
+                    tab.root = Node::Leaf(f.id);
+                    tab.focused = f.id;
                     return;
                 }
                 self.tabs.remove(t);
@@ -410,6 +485,32 @@ impl State {
         tab.zoomed = false;
     }
 
+    /// Floats split `id` above the others (never the last one in the layout), or docks it back
+    /// if it floats.
+    pub fn toggle_float(&mut self, id: u32) {
+        let Some(tab) = self.tabs.iter_mut().find(|t| t.has(id)) else { return };
+        if let Some(i) = tab.floating.iter().position(|f| f.id == id) {
+            let f = tab.floating.remove(i);
+            let placed = f.place.is_some_and(|p| tab.root.insert(p.beside, id, p.dir, p.share, p.first));
+            if !placed {
+                let at = tab.root.first();
+                tab.root.insert(at, id, Dir::Right, 0.5, false);
+            }
+        } else {
+            if !tab.root.contains(id) {
+                return;
+            }
+            let place = tab.root.place_of(id);
+            let Some(rest) = tab.root.remove(id) else { return };
+            tab.root = rest;
+            // Each new one a little lower and to the right of the last.
+            let k = (tab.floating.len() % 5) as f32 * 0.04;
+            tab.floating.push(Floating { id, place, rect: [0.18 + k, 0.14 + k, 0.6, 0.62], drag_from: None });
+        }
+        tab.focused = id;
+        tab.zoomed = false;
+    }
+
     /// Puts a minimized split back where it was (or beside the focused one).
     pub fn restore(&mut self, id: u32) {
         let Some(tab) = self.tabs.iter_mut().find(|t| t.minimized.iter().any(|m| m.id == id)) else { return };
@@ -426,6 +527,12 @@ impl State {
 
     fn focus_dir(&mut self, side: Side) {
         let tab = &self.tabs[self.active];
+        // From a floating split, arrows go back to the layout.
+        if tab.is_floating(tab.focused) {
+            let first = tab.root.first();
+            self.focus(first);
+            return;
+        }
         if let Some(id) = tab.root.neighbor(tab.focused, side) {
             self.focus(id);
         }
@@ -506,18 +613,19 @@ impl State {
                 },
             }
         }
-        // Minimized splits are still part of the session: report them where they were, so
-        // they stay in it and come back as splits when the session is restored.
+        // Minimized and floating splits are still part of the session: report them where they
+        // were, so they stay in it and come back as splits when the session is restored.
         let tabs: Vec<spooky::Node> = self
             .tabs
             .iter()
             .map(|t| {
                 let mut root = t.root.clone();
-                for m in &t.minimized {
-                    let placed = m.place.is_some_and(|p| root.insert(p.beside, m.id, p.dir, p.share, p.first));
+                let away = t.minimized.iter().map(|m| (m.id, m.place)).chain(t.floating.iter().map(|f| (f.id, f.place)));
+                for (id, place) in away {
+                    let placed = place.is_some_and(|p| root.insert(p.beside, id, p.dir, p.share, p.first));
                     if !placed {
                         let at = root.first();
-                        root.insert(at, m.id, Dir::Right, 0.5, false);
+                        root.insert(at, id, Dir::Right, 0.5, false);
                     }
                 }
                 node(&root, &self.panes)
@@ -566,6 +674,10 @@ impl State {
                     if let Some(p) = self.pending_open.take() {
                         self.requested.retain(|r| *r != p);
                     }
+                    // Still choosing: ask again.
+                    if self.chooser.is_some() && self.tabs.is_empty() {
+                        self.picker = Some(self.load_sessions());
+                    }
                 }
                 Event::Surfaces(s) => {
                     if let Some(w) = s.windows.iter().find(|w| w.id == self.window_id) {
@@ -582,7 +694,7 @@ impl State {
                 }
             }
         }
-        if self.tabs.is_empty() && self.pending_open.is_none() {
+        if self.tabs.is_empty() && self.pending_open.is_none() && self.chooser.is_none() {
             self.new_tab(None);
         }
         changed
@@ -625,11 +737,22 @@ impl State {
     /// Starts a new session in this window; the current one stays in spooky, detached.
     pub fn new_session(&mut self) {
         self.picker = None;
+        self.chooser = None;
         if self.controller.is_none() {
             return;
         }
         self.detach_all();
         self.new_tab(None);
+    }
+
+    /// The chooser's row: a new session, or one to open.
+    fn take_chosen(&mut self) {
+        let Some(at) = self.chooser else { return };
+        let name = at.checked_sub(1).and_then(|i| self.picker.as_ref()?.get(i)).map(|i| i.name.clone());
+        match name {
+            Some(name) => self.open_session(&name),
+            None => self.new_session(),
+        }
     }
 
     /// Opens session `name` in this window; the current one stays in spooky, detached. If
@@ -659,6 +782,7 @@ impl State {
     /// Rebuilds this window from a session's layout, attaching each of its panes.
     fn take_over(&mut self, open: spooky::Open) {
         self.detach_all();
+        self.chooser = None;
         self.session = Some(Session { name: open.session.clone(), animal: String::new() });
         fn build(s: &mut State, n: &spooky::Node) -> Option<Node> {
             if let Some(argv) = &n.argv {
@@ -684,7 +808,7 @@ impl State {
             if let Some(root) = build(self, t) {
                 let focused = root.first();
                 let tab = self.tab_id();
-                self.tabs.push(Tab { id: tab, root, focused, zoomed: false, minimized: vec![] });
+                self.tabs.push(Tab { id: tab, root, focused, zoomed: false, minimized: vec![], floating: vec![] });
             }
         }
         self.active = (open.active as usize).min(self.tabs.len().saturating_sub(1));
@@ -716,7 +840,7 @@ impl State {
     pub fn choose_own_emoji(&mut self) {
         let Some(name) = self.session.as_ref().map(|s| s.name.clone()) else { return };
         if self.picker.is_none() {
-            self.picker = Some(spooky::sessions());
+            self.picker = Some(self.load_sessions());
         }
         self.choose_emoji(&name);
     }
@@ -787,15 +911,30 @@ impl State {
         self.picker_mode = PickerMode::List;
         self.picker = match self.picker {
             Some(_) => None,
-            None if self.controller.is_some() => Some(spooky::sessions()),
+            None if self.controller.is_some() => Some(self.load_sessions()),
             None => None,
         };
+    }
+
+    /// The daemon's sessions for the picker, each with its accent (a session that has none
+    /// yet gets one, as it would when a window opens it).
+    fn load_sessions(&mut self) -> Vec<SessionInfo> {
+        let list = spooky::sessions();
+        self.picker_accents = list
+            .iter()
+            .map(|i| (i.name.clone(), crate::accents::of(&i.name, &self.accents, self.default_accent)))
+            .collect();
+        if let Some(s) = &self.session {
+            // This window's may have just changed.
+            self.picker_accents.insert(s.name.clone(), self.accent);
+        }
+        list
     }
 
     fn refresh_picker(&mut self) {
         self.picker_mode = PickerMode::List;
         if self.picker.is_some() {
-            self.picker = Some(spooky::sessions());
+            self.picker = Some(self.load_sessions());
         }
     }
 
@@ -810,6 +949,53 @@ impl State {
             eprintln!("runeterm: can't set {session}'s emoji: {e}");
         }
         self.refresh_picker();
+    }
+
+    /// Starts renaming `session` in the picker (opening it if it's closed), its name selected.
+    pub fn start_rename(&mut self, session: &str, tx: &mut Tx) {
+        if self.controller.is_none() {
+            return;
+        }
+        if self.picker.is_none() {
+            self.picker = Some(self.load_sessions());
+        }
+        let mut edit = rune::TextEdit::new(session);
+        edit.anchor = 0;
+        edit.focus = edit.text.len();
+        self.rename_edit = edit;
+        self.picker_mode = PickerMode::Rename { session: session.to_string(), error: None };
+        tx.focus("rename-field", false);
+    }
+
+    /// Renames the session being renamed to what was typed, or says why it can't.
+    pub fn finish_rename(&mut self) {
+        let PickerMode::Rename { session, .. } = &self.picker_mode else { return };
+        let old = session.clone();
+        let new = self.rename_edit.text.trim().to_string();
+        if new == old {
+            self.cancel_rename();
+            return;
+        }
+        let refuse = |s: &mut State, why: String| s.picker_mode = PickerMode::Rename { session: old.clone(), error: Some(why) };
+        if let Some(why) = session_name_problem(&new) {
+            return refuse(self, why.into());
+        }
+        if let Err(e) = spooky::rename(&old, &new) {
+            return refuse(self, e.to_string());
+        }
+        crate::accents::rename(&old, &new);
+        if let Some(sess) = self.session.as_mut().filter(|s| s.name == old) {
+            // spooky reports it too; show it now.
+            sess.name = new.clone();
+            self.accent_for = Some(new);
+        }
+        self.refresh_picker();
+    }
+
+    pub fn cancel_rename(&mut self) {
+        if matches!(self.picker_mode, PickerMode::Rename { .. }) {
+            self.picker_mode = PickerMode::List;
+        }
     }
 
     pub fn ask_kill(&mut self, session: &str) {
@@ -842,6 +1028,26 @@ impl State {
     /// Keybinds first (Ghostty's, from the user's config), then everything to the focused pane.
     pub fn key(&mut self, e: &KeyEvent, tx: &mut Tx) -> bool {
         let m = e.mods;
+        // A new window asking which session to be: arrows choose, Enter takes it, Escape starts
+        // a new one.
+        if let Some(at) = self.chooser.filter(|_| self.picker_mode == PickerMode::List) {
+            let n = self.picker.as_ref().map_or(0, |l| l.len()) + 1;
+            match e.key {
+                Key::Up => self.chooser = Some((at + n - 1) % n),
+                Key::Down | Key::Tab => self.chooser = Some((at + 1) % n),
+                Key::Enter => self.take_chosen(),
+                Key::Escape => self.new_session(),
+                _ => {}
+            }
+            return true;
+        }
+        // Renaming a session: its field takes the typing; Escape gives up.
+        if self.picker.is_some() && matches!(self.picker_mode, PickerMode::Rename { .. }) {
+            if e.key == Key::Escape {
+                self.cancel_rename();
+            }
+            return true;
+        }
         // A close waiting for a yes takes Enter and Escape.
         if let Some(id) = self.confirm_close {
             match e.key {
@@ -913,6 +1119,7 @@ impl State {
                 Some('\n' | 'z') => { let id = self.tabs[self.active].focused; self.toggle_zoom(id); true }
                 Some('x') => { let id = self.tabs[self.active].focused; self.request_close(id); true }
                 Some('m') => { let id = self.tabs[self.active].focused; self.minimize(id); true }
+                Some('f') => { let id = self.tabs[self.active].focused; self.toggle_float(id); true }
                 Some('r') => { self.reload_config(); true }
                 Some('e') => { self.edit_scrollback(); true }
                 Some('/') => { self.toggle_sidebar(); true }
@@ -1293,6 +1500,50 @@ mod tests {
         assert_eq!(s.tabs[0].root, before);
         assert!(s.tabs[0].minimized.is_empty());
         assert_eq!(s.tabs[0].focused, ids[1]);
+    }
+
+    #[test]
+    fn a_floating_split_docks_back_in_place() {
+        let mut s = state_with(3);
+        let before = s.tabs[0].root.clone();
+        let ids = before.leaves();
+        s.toggle_float(ids[1]);
+        assert_eq!(s.tabs[0].root.leaves(), vec![ids[0], ids[2]]);
+        assert!(s.tabs[0].is_floating(ids[1]) && s.tabs[0].has(ids[1]));
+        assert_eq!(s.tabs[0].focused, ids[1]);
+        s.toggle_float(ids[1]);
+        assert_eq!(s.tabs[0].root, before);
+        assert!(s.tabs[0].floating.is_empty());
+    }
+
+    #[test]
+    fn the_last_split_in_the_layout_does_not_float() {
+        let mut s = state_with(1);
+        let id = s.tabs[0].focused;
+        s.toggle_float(id);
+        assert!(s.tabs[0].floating.is_empty());
+        assert_eq!(s.tabs[0].root.leaves(), vec![id]);
+    }
+
+    #[test]
+    fn a_floating_split_stays_inside_the_tab() {
+        let mut f = Floating { id: 1, place: None, rect: [0.2, 0.2, 0.5, 0.5], drag_from: None };
+        f.drag_from = Some(f.rect);
+        f.drag(-1.0, 2.0, false);
+        assert_eq!(f.rect, [0.0, 0.5, 0.5, 0.5]);
+        f.drag_from = Some(f.rect);
+        f.drag(1.0, -1.0, true);
+        assert_eq!(f.rect, [0.0, 0.5, 1.0, 0.2]);
+    }
+
+    #[test]
+    fn session_names_are_checked() {
+        assert!(session_name_problem("cozy-otter").is_none());
+        assert!(session_name_problem("").is_some());
+        assert!(session_name_problem("two words").is_some());
+        assert!(session_name_problem("a/b").is_some());
+        assert!(session_name_problem("-x").is_some());
+        assert!(session_name_problem(&"x".repeat(33)).is_some());
     }
 
     #[test]

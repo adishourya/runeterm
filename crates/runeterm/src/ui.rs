@@ -127,7 +127,7 @@ fn pane(s: &State, tab: &Tab, id: u32) -> El {
     let focused = id == tab.focused;
     let (program, cwd) = s.panes.get(&id).map(|p| (p.program.as_str(), p.cwd.as_str())).unwrap_or(("", ""));
     let attention = s.needs_attention(id);
-    let busy = !icons::is_shell(program);
+    let floating = tab.is_floating(id);
     let only = tab.root.leaves().len() == 1;
 
     let mut title = row().gap(9.0).items_center().grow(1.0).min_w(0.0)
@@ -136,21 +136,25 @@ fn pane(s: &State, tab: &Tab, id: u32) -> El {
         .child(text(cwd.to_string()).font(BODY).color(look::dim()).single_line().truncate().shrink());
     if attention {
         title = title.child(dot(look::attention(), true));
-    } else if busy {
-        title = title.child(dot(look::busy(), false));
     }
     // Unfocused splits keep their buttons hidden until hovered.
-    let mut tools = row().gap(1.0).ml(8.0)
-        .child(tool(format!("split-r-{id}"), &icons::SPLIT_RIGHT, "Split right  ⌥[", move |s: &mut State| {
-            s.focus(id);
-            s.split(Dir::Right)
-        }))
-        .child(tool(format!("split-d-{id}"), &icons::SPLIT_DOWN, "Split down  ⌥-", move |s: &mut State| {
-            s.focus(id);
-            s.split(Dir::Down)
-        }));
-    if !only {
+    let mut tools = row().gap(1.0).ml(8.0);
+    if floating {
+        tools = tools.child(tool(format!("dock-{id}"), &icons::DOCK, "Dock  ⌥F", move |s: &mut State| s.toggle_float(id)));
+    } else {
         tools = tools
+            .child(tool(format!("split-r-{id}"), &icons::SPLIT_RIGHT, "Split right  ⌥[", move |s: &mut State| {
+                s.focus(id);
+                s.split(Dir::Right)
+            }))
+            .child(tool(format!("split-d-{id}"), &icons::SPLIT_DOWN, "Split down  ⌥-", move |s: &mut State| {
+                s.focus(id);
+                s.split(Dir::Down)
+            }));
+    }
+    if !only && !floating {
+        tools = tools
+            .child(tool(format!("float-{id}"), &icons::FLOAT, "Float  ⌥F", move |s: &mut State| s.toggle_float(id)))
             .child(tool(format!("min-{id}"), &icons::MINIMIZE, "Minimize  ⌥M", move |s: &mut State| s.minimize(id)))
             .child(if tab.zoomed {
                 zoomed_button(id)
@@ -161,10 +165,14 @@ fn pane(s: &State, tab: &Tab, id: u32) -> El {
     tools = tools.child(tool(format!("close-{id}"), &icons::CLOSE, "Close  ⌥X", move |s: &mut State| s.request_close(id)));
     let tools = if focused { tools } else { tools.group_opacity(0.0, 1.0) };
 
-    let header = row().key(format!("head-{id}")).h(40.0).w_full().pl(12.0).pr(8.0).items_center()
+    let mut header = row().key(format!("head-{id}")).h(40.0).w_full().pl(12.0).pr(8.0).items_center()
         .opacity(if focused { 1.0 } else { 0.62 })
         .child(title)
         .child(tools);
+    if floating {
+        // A floating split moves by its header.
+        header = header.cursor(Cursor::Grab).on_drag(move |s: &mut State, d: &mut Drag, tx: &mut Tx| float_drag(s, id, d, tx, false));
+    }
 
     let tint = if attention { look::attention() } else { look::accent() };
     let mut card = col().key(format!("pane-{id}")).matched(format!("pane-{id}"))
@@ -180,35 +188,34 @@ fn pane(s: &State, tab: &Tab, id: u32) -> El {
         // Taken here so a drag on the header doesn't move the dividers around it.
         .on_drag(|_: &mut State, _: &mut Drag, _: &mut Tx| {});
     if focused || attention {
-        // A light in the accent across the header strip only (it never reaches the terminal),
-        // slowly breathing.
+        // A band of the accent across the header strip only (it never reaches the terminal):
+        // full strength across almost all of it, fading out just at the two ends. Steady, so
+        // the focused split reads at a glance.
         card = card
             .shadow(1.0, 3.0, look::shade(0.45))
             .shadow(14.0, 44.0, look::shade(0.55))
             .child(
                 el().key(format!("glow-{id}")).absolute(0.0, 0.0).w_full().h(40.0)
-                    // Left to right across the ribbon, strongest in the middle and thinning out
-                    // towards both ends.
                     .linear_gradient(
                         std::f32::consts::FRAC_PI_2,
                         {
-                            let peak = if focused { 0.17 } else { 0.1 };
+                            let peak = if focused { 0.34 } else { 0.18 };
                             [
-                                (0.0, tint.alpha(0.0)),
-                                (0.2, tint.alpha(peak * 0.45)),
-                                (0.5, tint.alpha(peak)),
-                                (0.8, tint.alpha(peak * 0.45)),
-                                (1.0, tint.alpha(0.0)),
+                                (0.0, tint.alpha(peak * 0.15)),
+                                (0.06, tint.alpha(peak * 0.75)),
+                                (0.16, tint.alpha(peak)),
+                                (0.84, tint.alpha(peak)),
+                                (0.94, tint.alpha(peak * 0.75)),
+                                (1.0, tint.alpha(peak * 0.15)),
                             ]
                         },
                     )
-                    .cycle(BREATHE)
                     .transition(Transition::opacity()),
             )
             .child(
                 // A hairline of the same light along the top edge.
                 el().key(format!("rim-{id}")).absolute(0.0, 0.0).w_full().h(1.0)
-                    .linear_gradient(std::f32::consts::FRAC_PI_2, [(0.0, tint.alpha(0.0)), (0.5, tint.alpha(0.75)), (1.0, tint.alpha(0.0))])
+                    .linear_gradient(std::f32::consts::FRAC_PI_2, [(0.0, tint.alpha(0.1)), (0.12, tint.alpha(0.85)), (0.88, tint.alpha(0.85)), (1.0, tint.alpha(0.1))])
                     .cycle(BREATHE)
                     .transition(Transition::opacity()),
             );
@@ -230,10 +237,51 @@ fn pane(s: &State, tab: &Tab, id: u32) -> El {
             true
         });
     card = card.child(header).child(grid);
+    if floating {
+        // The corner it resizes from.
+        card = card.child(
+            el().key(format!("resize-{id}")).pin(None, None, Some(0.0), Some(0.0)).size(22.0, 22.0)
+                .cursor(Cursor::Move).help("Drag to resize")
+                .on_drag(move |s: &mut State, d: &mut Drag, tx: &mut Tx| float_drag(s, id, d, tx, true))
+                .child(el().pin(None, None, Some(6.0), Some(6.0)).size(8.0, 8.0).radius(2.0)
+                    .border(1.5, look::ink(0.25))),
+        );
+    }
     if s.confirm_close == Some(id) {
         card = card.child(row().pin(Some(0.0), None, Some(0.0), Some(18.0)).justify_center().child(confirm_close(s, id, program)));
     }
     card
+}
+
+/// Dragging a floating split's header (or, with `resize`, its corner).
+fn float_drag(s: &mut State, id: u32, d: &mut Drag, tx: &mut Tx, resize: bool) {
+    let [w, h] = s.stage;
+    let Some(f) = s.tabs.iter_mut().flat_map(|t| t.floating.iter_mut()).find(|f| f.id == id) else { return };
+    match d.phase {
+        Phase::Down => f.drag_from = Some(f.rect),
+        Phase::Move => {
+            f.drag(d.dx / w.max(1.0), d.dy / h.max(1.0), resize);
+            tx.instant(); // follow the pointer, no spring
+        }
+        Phase::Up => {
+            f.drag_from = None;
+            s.focus(id);
+        }
+    }
+}
+
+/// The floating splits of `tab`, over its layout.
+fn floats(s: &State, tab: &Tab) -> El {
+    let [w, h] = s.stage;
+    let mut layer = el().key(format!("floats-{}", tab.id)).pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0));
+    for f in &tab.floating {
+        let [x, y, fw, fh] = f.rect;
+        let card = el().key(format!("float-{}", f.id)).absolute(x * w, y * h).size(fw * w, fh * h)
+            .radius(look::RADIUS)
+            .shadow(6.0, 20.0, look::shade(0.5)).shadow(24.0, 70.0, look::shade(0.6));
+        layer = layer.child(card.raise().child(pane(s, tab, f.id)));
+    }
+    layer
 }
 
 /// Asking before closing a split that's running something: Enter closes, Escape keeps it.
@@ -311,10 +359,11 @@ fn leaf(s: &State, tab: &Tab, id: u32, active_tab: bool) -> El {
     if minimized {
         r = r.opacity(0.7).child(icon(&icons::MINIMIZE, 12.0).color(look::faint()));
     }
+    if tab.is_floating(id) {
+        r = r.child(icon(&icons::FLOAT, 12.0).color(look::faint()));
+    }
     if attention {
         r = r.child(dot(look::attention(), true));
-    } else if p.is_some_and(|p| !icons::is_shell(&p.program)) {
-        r = r.child(dot(look::busy(), false));
     }
     r
 }
@@ -518,7 +567,13 @@ fn wide(s: &State) -> El {
         .child(badge(s, 60.0))
         .child(col().gap(3.0).grow(1.0).min_w(0.0)
             .child(text("SESSION").font(CAPS).color(c.alpha(0.9)))
-            .child(text(session_name(s)).font(TextStyle::new(19.0, 700.0)).color(look::text()).single_line().truncate())
+            .child(text(session_name(s)).font(TextStyle::new(19.0, 700.0)).color(look::text()).single_line().truncate()
+                .key("session-title").help("Double-click to rename")
+                .on_double_press_tx(|s: &mut State, tx: &mut Tx| {
+                    if let Some(name) = s.session.as_ref().map(|x| x.name.clone()) {
+                        s.start_rename(&name, tx);
+                    }
+                }))
             .child(text(format!("{} tab{} · {} split{}", s.tabs.len(), if s.tabs.len() == 1 { "" } else { "s" }, panes, if panes == 1 { "" } else { "s" })).font(SMALL).color(look::faint()))
             .when(s.sidebar.host && !s.user_host.is_empty(), |c| {
                 c.child(row().gap(5.0).items_center().mt(2.0)
@@ -644,24 +699,33 @@ fn sidebar(s: &State) -> El {
 /// session's emoji, or kill one.
 fn picker(s: &State, sessions: &[crate::spooky::SessionInfo]) -> El {
     let body = match &s.picker_mode {
-        PickerMode::Emoji { session, animals } => emoji_grid(sessions, session, animals),
+        PickerMode::Emoji { session, animals } => emoji_grid(sessions, session, animals, session_accent(s, session)),
         mode => session_list(s, sessions, mode),
     };
-    let panel = col().key("picker").absolute(s.sidebar.width + 8.0, 12.0).w(356.0).max_h(600.0).p_all(8.0).gap(4.0).radius(16.0)
+    let choosing = s.chooser.is_some();
+    let mut panel = col().key("picker").w(if choosing { 420.0 } else { 356.0 }).max_h(600.0).p_all(8.0).gap(4.0).radius(16.0)
         .fill(look::surface(2).alpha(0.96)).backdrop_blur(24.0)
         .border(1.0, look::ink(0.08))
         .shadow(4.0, 12.0, look::shade(0.45)).shadow(24.0, 64.0, look::shade(0.55))
         .raise()
-        .transition(Transition::offset(0.0, -6.0).combined(Transition::scale(0.97)).combined(Transition::opacity()))
-        .child(body);
+        .transition(Transition::offset(0.0, -6.0).combined(Transition::scale(0.97)).combined(Transition::opacity()));
+    if choosing {
+        // A new window asking which session to be: in the middle, and it stays until answered.
+        panel = panel.child(col().px(10.0).pt(8.0).pb(4.0).gap(3.0)
+            .child(text("Open a session").font(TextStyle::new(17.0, 700.0)).color(look::text()))
+            .child(text("↑↓ to choose · Enter to open · Esc for a new one").font(SMALL).color(look::faint())));
+        return el().key("picker-layer").pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0)).raise().center()
+            .child(panel.child(body));
+    }
     // Clicking anywhere else closes it.
     el().key("picker-layer").pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0)).raise()
         .child(el().pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0)).on_press(|s: &mut State| s.picker = None))
-        .child(panel)
+        .child(panel.absolute(s.sidebar.width + 8.0, 12.0).child(body))
 }
 
 fn session_list(s: &State, sessions: &[crate::spooky::SessionInfo], mode: &PickerMode) -> El {
     let current = s.session.as_ref().map(|x| x.name.as_str());
+    let chosen = |i: usize, r: El| if s.chooser == Some(i) { r.fill(look::accent().alpha(0.12)).border(1.0, look::accent().alpha(0.35)) } else { r };
     let new = row().key("picker-new").h(52.0).w_full().px(10.0).gap(12.0).items_center().radius(12.0)
         .hover(look::ink(0.05)).cursor(Cursor::Pointer)
         .on_press(|s: &mut State| s.new_session())
@@ -671,10 +735,11 @@ fn session_list(s: &State, sessions: &[crate::spooky::SessionInfo], mode: &Picke
             .child(text("New session").font(TITLE).color(look::text()))
             .child(text("Start fresh in this window").font(SMALL).color(look::faint())));
     let mut list = col().gap(2.0).w_full();
-    for info in sessions {
+    let new = chosen(0, new);
+    for (i, info) in sessions.iter().enumerate() {
         let here = current == Some(info.name.as_str());
         let (tint, label) = match (here, info.state.as_str()) {
-            (true, _) => (look::busy(), "this window"),
+            (true, _) => (session_accent(s, &info.name), "this window"),
             (_, "open") => (hex("#7aa2f7").unwrap(), "open"),
             (_, "detached") => (hex("#c0a36e").unwrap(), "detached"),
             _ => (look::faint(), "saved"),
@@ -689,9 +754,18 @@ fn session_list(s: &State, sessions: &[crate::spooky::SessionInfo], mode: &Picke
             (_, true) => panes,
             (_, false) => format!("{panes} · {}", info.running),
         };
-        let (open, emoji, kill) = (info.name.clone(), info.name.clone(), info.name.clone());
+        let (open, emoji, kill, rename) = (info.name.clone(), info.name.clone(), info.name.clone(), info.name.clone());
+        let renaming = match mode {
+            PickerMode::Rename { session, error } if *session == info.name => Some(error.clone()),
+            _ => None,
+        };
+        // The session's tile glows in its own accent, as its badge does.
+        let own = session_accent(s, &info.name);
         let tile = el().key(format!("picker-emoji-{}", info.name)).size(36.0, 36.0).radius(10.0).center()
-            .fill(tint.alpha(0.14)).border(1.0, tint.alpha(0.26))
+            .fill(look::surface(3))
+            .radial_gradient([0.5, 0.0], [40.0, 40.0], [(0.0, own.alpha(0.42)), (0.65, own.alpha(0.12)), (1.0, own.alpha(0.04))])
+            .border(1.0, own.alpha(0.45))
+            .shadow(4.0, 14.0, own.alpha(0.22))
             .hover(look::ink(0.08)).hover_alone().cursor(Cursor::Pointer)
             .help("Change emoji")
             .on_press(move |s: &mut State| s.choose_emoji(&emoji))
@@ -702,6 +776,16 @@ fn session_list(s: &State, sessions: &[crate::spooky::SessionInfo], mode: &Picke
             .group_opacity(0.0, 1.0)
             .on_press(move |s: &mut State| s.ask_kill(&kill))
             .child(icon(&icons::TRASH, 15.0).color(look::dim()));
+        let pencil = el().key(format!("picker-rename-{}", info.name)).size(28.0, 28.0).radius(8.0).center()
+            .hover(look::ink(0.08)).cursor(Cursor::Pointer)
+            .help("Rename session")
+            .group_opacity(0.0, 1.0)
+            .on_press_tx(move |s: &mut State, tx: &mut Tx| s.start_rename(&rename, tx))
+            .child(icon(&icons::PENCIL, 15.0).color(look::dim()));
+        if let Some(error) = renaming {
+            list = list.child(rename_row(s, tile, error));
+            continue;
+        }
         let mut r = row().key(format!("picker-{}", info.name)).h(54.0).w_full().pl(9.0).pr(6.0).gap(12.0).items_center().radius(12.0)
             .hover(look::ink(0.05)).hover_group().cursor(Cursor::Pointer)
             .on_press(move |s: &mut State| s.open_session(&open))
@@ -711,11 +795,12 @@ fn session_list(s: &State, sessions: &[crate::spooky::SessionInfo], mode: &Picke
                 .child(text(detail).font(SMALL).color(look::faint()).single_line().truncate()))
             .child(el().h(20.0).px(8.0).radius(10.0).center().fill(tint.alpha(0.12))
                 .child(text(label).font(CAPS).color(tint)))
+            .child(pencil)
             .child(trash);
         if here {
             r = r.fill(look::ink(0.04));
         }
-        list = list.child(r);
+        list = list.child(chosen(i + 1, r));
     }
     col().w_full().gap(4.0)
         .child(row().h(28.0).px(10.0).items_center()
@@ -725,6 +810,36 @@ fn session_list(s: &State, sessions: &[crate::spooky::SessionInfo], mode: &Picke
         .child(new)
         .child(el().h(1.0).w_full().my(4.0).fill(look::ink(0.06)))
         .child(list)
+}
+
+/// A session's row while it's renamed: its name is a text field. Enter keeps the new name,
+/// Escape (or the cancel button) the old.
+fn rename_row(s: &State, tile: El, error: Option<String>) -> El {
+    let field = rune::text_input(&s.rename_edit, TITLE)
+        .key("rename-field")
+        .single_line()
+        .caret(look::accent(), look::accent().alpha(0.3))
+        .color(look::text())
+        .on_edit(|s: &mut State| &mut s.rename_edit)
+        .on_submit(|s: &mut State, _: &mut Tx| s.finish_rename())
+        .w_full();
+    let (hint, hint_color) = match error {
+        Some(e) => (e, look::attention()),
+        None => ("Enter to rename · Esc to cancel".to_string(), look::faint()),
+    };
+    let button = |key: &str, glyph: &'static rune::Icon, help: &str| {
+        el().key(key.to_string()).size(28.0, 28.0).radius(8.0).center()
+            .hover(look::ink(0.08)).cursor(Cursor::Pointer).help(help.to_string())
+            .child(icon(glyph, 15.0).color(look::dim()))
+    };
+    row().key("picker-renaming").h(54.0).w_full().pl(9.0).pr(6.0).gap(12.0).items_center().radius(12.0)
+        .fill(look::accent().alpha(0.08)).border(1.0, look::accent().alpha(0.35))
+        .child(tile)
+        .child(col().gap(3.0).grow(1.0).min_w(0.0)
+            .child(el().h(22.0).w_full().px(6.0).radius(6.0).fill(look::ink(0.06)).items_center().child(field))
+            .child(text(hint).font(SMALL).color(hint_color).single_line().truncate()))
+        .child(button("rename-ok", &icons::CHECK, "Rename").on_press(|s: &mut State| s.finish_rename()))
+        .child(button("rename-cancel", &icons::CLOSE, "Cancel").on_press(|s: &mut State| s.cancel_rename()))
 }
 
 /// Killing ends the session's panes, so the row asks first.
@@ -746,7 +861,16 @@ fn confirm_kill(info: &crate::spooky::SessionInfo, panes: &str) -> El {
 }
 
 /// Every animal spooky offers; the session's current one is ringed.
-fn emoji_grid(sessions: &[crate::spooky::SessionInfo], session: &str, animals: &[(String, String)]) -> El {
+/// A listed session's own accent (this window's follows a swatch click at once).
+fn session_accent(s: &State, name: &str) -> Color {
+    let c = match &s.session {
+        Some(sess) if sess.name == name => s.accent,
+        _ => s.picker_accents.get(name).copied().unwrap_or(s.default_accent),
+    };
+    hex(&crate::config::hex_of(c)).unwrap()
+}
+
+fn emoji_grid(sessions: &[crate::spooky::SessionInfo], session: &str, animals: &[(String, String)], accent: Color) -> El {
     let current = sessions.iter().find(|i| i.name == session).map(|i| i.animal.clone()).unwrap_or_default();
     let section = |title: &str, items: &[(String, String)]| {
         let mut grid = row().flex_wrap().gap(4.0).w_full();
@@ -759,7 +883,7 @@ fn emoji_grid(sessions: &[crate::spooky::SessionInfo], session: &str, animals: &
                 .on_press(move |s: &mut State| s.set_emoji(&session, &name))
                 .child(text(glyph.clone()).font(TextStyle::new(22.0, 400.0)));
             if chosen {
-                cell = cell.fill(look::busy().alpha(0.14)).border(1.5, look::busy().alpha(0.7));
+                cell = cell.fill(accent.alpha(0.16)).border(1.5, accent.alpha(0.75));
             }
             grid = grid.child(cell);
         }
@@ -843,10 +967,20 @@ pub fn view(s: &State, _: &mut Cx<State>) -> El {
     let slide = |d: f32| Transition::offset(0.0, 90.0 * d).combined(Transition::opacity());
     let layer = el().key(format!("tab-layer-{}", s.tab().map_or(0, |t| t.id)))
         .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
-        .transition(slide(dir))
-        .child(main);
+        .transition(slide(dir));
+    let layer = layer.child(main);
+    let mut layer = layer;
+    if let Some(tab) = s.tab().filter(|t| !t.floating.is_empty() && !t.zoomed) {
+        layer = layer.child(floats(s, tab));
+    }
     let mut stage = el().key("stage").grow(1.0).h_full().min_w(0.0)
         .clip_rounded(look::RADIUS)
+        // Floating splits are placed as fractions of it.
+        .on_layout(|s: &mut State, r: [f32; 4]| {
+            if s.stage != [r[2], r[3]] {
+                s.stage = [r[2], r[3]];
+            }
+        })
         .child_exit(slide(-dir))
         .child(layer);
     if let Some(tab) = s.tab().filter(|t| !t.minimized.is_empty()) {
@@ -889,6 +1023,12 @@ pub fn spec() -> AppSpec<State> {
                 if let Some(p) = s.focused_id().and_then(|id| s.panes.get(&id)) {
                     p.send(b"seq 1 300\n");
                 }
+            }),
+            ("floating", |s| {
+                // Two splits, the second floating above the first.
+                s.split(Dir::Right);
+                let id = s.tabs[0].focused;
+                s.toggle_float(id);
             }),
             ("follow", |s| {
                 // Output that goes on after a while, to check the bottom still follows it.

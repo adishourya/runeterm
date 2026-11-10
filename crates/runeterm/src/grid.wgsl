@@ -75,7 +75,11 @@ fn fs(o: Out) -> @location(0) vec4<f32> {
     var a = o.color.a;
     var rgb = o.color.rgb;
     if (o.kind == 1u) {
-        a *= textureLoad(atlas, vec2<i32>(floor(o.uv)), 0).r;
+        // Blending in linear light thins dark text on a light background (light text on dark
+        // comes out as intended): give darker text back its weight by raising its coverage.
+        let cov = textureLoad(atlas, vec2<i32>(floor(o.uv)), 0).r;
+        let lum = dot(o.color.rgb, vec3(0.2126, 0.7152, 0.0722));
+        a *= pow(cov, mix(1.0 / 1.7, 1.0, clamp(lum, 0.0, 1.0)));
     } else if (o.kind == 2u) {
         rgb = px.rgb;
         a = px.a;

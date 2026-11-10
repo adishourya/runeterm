@@ -58,6 +58,19 @@ pub fn set(name: &str, c: Rgb) {
     save(&all);
 }
 
+/// A renamed session keeps its colour.
+pub fn rename(old: &str, new: &str) {
+    let mut all = load();
+    let mut changed = false;
+    for (n, _) in all.iter_mut().filter(|(n, _)| n == old) {
+        *n = new.to_string();
+        changed = true;
+    }
+    if changed {
+        save(&all);
+    }
+}
+
 /// Forgets a killed session, freeing its colour.
 pub fn remove(name: &str) {
     let mut all = load();

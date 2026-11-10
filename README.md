@@ -9,8 +9,8 @@ owns every pty, so splits and tabs outlive the window and come back after a rebo
   its own wgpu pipeline, clipped to the surface's corners.
 - Kitty graphics, box drawing drawn to the cell, colour emoji and font fallback.
 - Ghostty-compatible custom shaders (`custom-shader`), including cursor shaders.
-- A sidebar of tabs and their splits, a session picker (new, restore, change animal, kill),
-  minimized splits as floating pills.
+- A sidebar of tabs and their splits, a session picker (new, restore, rename, change animal,
+  kill), minimized splits as pills, and splits that float above the others.
 - Each session has its own animal emoji (spooky's animals, in colour) and its own accent
   (picked so no two sessions share one, kept in `~/.local/state/runeterm/accents`).
 
@@ -52,10 +52,14 @@ spooky too.
 
 ## Use
 
-- `runeterm` opens a new session; `runeterm attach NAME` opens an existing one.
+- `runeterm` opens a new session, first asking whether to open one of the detached or saved
+  sessions instead if there are any (↑↓, Enter, Esc for a new one); `runeterm attach NAME`
+  opens one straight away. New sessions get two-word names (`quiet-river`).
+- Rename a session from the picker (the pencil on its row) or by double-clicking its name in
+  the sidebar; change its animal by clicking its emoji (or right-clicking the badge).
 - Settings: `~/.config/runeterm/config` (written from Ghostty's on first run). ⌥R reloads.
 - Keys: ⌥[ / ⌥- split, ⌥h/j/k/l focus, ⌥⇧h/j/k/l swap, ⌥w/a/s/d resize, ⌥Z (or ⌥↩) full screen, ⌥M minimize,
-  ⌥X close, ⌥T new tab, ⌥1–9 tabs, ⌥/ pin or unpin the sidebar, ⌥E open the scrollback in
+  ⌥F float or dock (drag a floating split by its header, resize it from its corner), ⌥X close, ⌥T new tab, ⌥1–9 tabs, ⌥/ pin or unpin the sidebar, ⌥E open the scrollback in
   an editor (`scrollback-editor`).
 - Mouse: drag to select (twice for a word, three times for a line), Ctrl+Shift+C / Ctrl+Shift+V
   copy and paste, middle-click pastes the selection, Ctrl+click opens links, drag the gap between
