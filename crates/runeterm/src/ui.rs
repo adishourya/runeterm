@@ -671,6 +671,14 @@ fn appearance(s: &State) -> El {
             );
         }
         c = c.child(swatches);
+        // `font-size-fit` moved the size or spacing so the lines fill the splits: say so.
+        if let Some((pt, line)) = crate::grid::fitted() {
+            let mut what = format!("Fitted: {pt:.1} pt");
+            if line.abs() >= 0.5 {
+                what += &format!(" · line {line:+.0}%");
+            }
+            c = c.child(text(what).font(SMALL).color(look::faint()).pb(2.0));
+        }
     }
     c
 }

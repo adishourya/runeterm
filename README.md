@@ -58,6 +58,9 @@ spooky too.
 - Rename a session from the picker (the pencil on its row) or by double-clicking its name in
   the sidebar; change its animal by clicking its emoji (or right-clicking the badge).
 - Settings: `~/.config/runeterm/config` (written from Ghostty's on first run). ⌥R reloads.
+- `font-size-fit = 3%` lets the line height (and, if that's not enough, the font size) move by
+  up to that much so the lines fill the splits with no blank strip under the last one; the
+  appearance section shows what it chose. 0 (the default) keeps them exact.
 - Keys: ⌥[ / ⌥- split, ⌥h/j/k/l focus, ⌥⇧h/j/k/l swap, ⌥w/a/s/d resize, ⌥Z (or ⌥↩) full screen, ⌥M minimize,
   ⌥F float or dock (drag a floating split by its header, resize it from its corner), ⌥X close, ⌥T new tab, ⌥1–9 tabs, ⌥/ pin or unpin the sidebar, ⌥E open the scrollback in
   an editor (`scrollback-editor`).

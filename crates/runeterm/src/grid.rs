@@ -49,6 +49,53 @@ pub struct FontSpec {
     pub cell_height_px: f32,
     /// Space between the pane's edge and the grid.
     pub padding: f32,
+    /// `font-size-fit`: how far (a fraction) the line height and font size may move so the
+    /// lines fill the grid with nothing left under the last one; 0 keeps them exact.
+    pub fit: f32,
+}
+
+/// The cell size that fills a grid `target` device pixels tall best: a font size (px) and a
+/// cell height, each within `pct` of the configured `base_px` and the cell height `line` (a
+/// fraction) and `line_px` give at that size. `natural(px)` is the font's own line height at
+/// `px`. The smallest strip left under the last line wins; between equal strips, the smaller
+/// change, a font size change counting three times a line height change (so the letters keep
+/// their size when spacing alone does it).
+pub fn fit(target: f32, base_px: f32, line: f32, line_px: f32, pct: f32, natural: impl Fn(f32) -> f32) -> (f32, f32) {
+    let cell = |px: f32| natural(px) * (1.0 + line) + line_px;
+    let base_h = cell(base_px).round().max(1.0);
+    let mut best = (base_px, base_h);
+    if pct <= 0.0 || target < base_h {
+        return best;
+    }
+    let left = |h: f32| target - (target / h).floor() * h;
+    let cost = |px: f32, h: f32| 3.0 * (px / base_px - 1.0).abs() + (h / cell(px) - 1.0).abs();
+    let mut best_key = (left(base_h), cost(base_px, base_h));
+    let px_lo = (base_px * (1.0 - pct)).ceil().max(1.0) as i32;
+    let px_hi = (base_px * (1.0 + pct)).floor() as i32;
+    for px in px_lo..=px_hi {
+        let px = px as f32;
+        let own = cell(px);
+        let lo = (own * (1.0 - pct)).ceil().max(natural(px).ceil()).max(1.0) as i32;
+        let hi = (own * (1.0 + pct)).floor() as i32;
+        for h in lo..=hi {
+            let h = h as f32;
+            let key = (left(h), cost(px, h));
+            // Half a pixel of strip is nothing; then the smaller change.
+            let better = key.0 + 0.5 < best_key.0 || ((key.0 - best_key.0).abs() <= 0.5 && key.1 < best_key.1);
+            if better {
+                best = (px, h);
+                best_key = key;
+            }
+        }
+    }
+    best
+}
+
+/// The fit in use, for the UI: the font size (points) and the line height's change (percent).
+static FITTED: std::sync::Mutex<Option<(f32, f32)>> = std::sync::Mutex::new(None);
+
+pub fn fitted() -> Option<(f32, f32)> {
+    *FITTED.lock().unwrap()
 }
 
 /// Regular, bold, italic and bold italic, then fallbacks found per character (emoji, CJK,
@@ -645,6 +692,10 @@ pub struct GridRenderer {
     moving: bool,
     /// The panes drawn last frame: the ones to update (and run shaders for) before the next.
     last_seen: Vec<u32>,
+    /// `font-size-fit`: the tallest grid's height and since when it's been that, and the fit
+    /// made for a height: (height, font px, cell height).
+    fit_seen: Option<(f32, f64)>,
+    fitted: Option<(f32, f32, f32)>,
 }
 
 impl GridRenderer {
@@ -671,6 +722,8 @@ impl GridRenderer {
             frame: 0,
             moving: true,
             last_seen: vec![],
+            fit_seen: None,
+            fitted: None,
         }
     }
 
@@ -680,6 +733,8 @@ impl GridRenderer {
         self.spec = config.font.clone();
         self.fonts = Fonts::load(&config.font.family);
         self.metrics = None;
+        self.fitted = None;
+        self.fit_seen = None;
         self.atlas = Atlas::new();
         self.theme = config.colors();
         self.accent = config.accent;
@@ -692,19 +747,87 @@ impl GridRenderer {
         self.textures.clear();
     }
 
-    /// Cell metrics at `scale` device pixels per point. Ghostty sizes fonts in points at 96 dpi.
-    fn metrics_for(&self, scale: f32) -> Metrics {
-        let px = (self.spec.size * 96.0 / 72.0 * scale).round();
+    /// The configured font size in device pixels at `scale`. Ghostty sizes fonts in points at
+    /// 96 dpi.
+    fn base_px(&self, scale: f32) -> f32 {
+        (self.spec.size * 96.0 / 72.0 * scale).round()
+    }
+
+    /// The font's own line height (ascent, descent, leading) at `px`.
+    fn natural(&self, px: f32) -> f32 {
+        match self.fonts.get(0) {
+            Some(font) => {
+                let m = font.metrics(&[]).scale(px);
+                m.ascent + m.descent + m.leading
+            }
+            None => px * 1.3,
+        }
+    }
+
+    /// The font size and cell height to draw at: the configured ones, or the fit for the
+    /// tallest grid when `font-size-fit` is on.
+    fn cell_size(&self, scale: f32) -> (f32, f32) {
+        if let Some((_, px, h)) = self.fitted.filter(|_| self.spec.fit > 0.0) {
+            return (px, h);
+        }
+        let px = self.base_px(scale);
+        let h = (self.natural(px) * (1.0 + self.spec.cell_height) + self.spec.cell_height_px * scale).round().max(1.0);
+        (px, h)
+    }
+
+    /// Cell metrics for a font size and cell height, both in device pixels.
+    fn metrics_with(&self, px: f32, h: f32) -> Metrics {
         let Some(font) = self.fonts.get(0) else {
-            return Metrics { w: (px * 0.6).round(), h: (px * 1.3).round(), baseline: px, px };
+            return Metrics { w: (px * 0.6).round(), h, baseline: px, px };
         };
         let m = font.metrics(&[]).scale(px);
         let gid = font.charmap().map('M');
         let w = font.glyph_metrics(&[]).scale(px).advance_width(gid).round().max(1.0);
-        let natural = m.ascent + m.descent + m.leading;
-        let h = (natural * (1.0 + self.spec.cell_height) + self.spec.cell_height_px * scale).round().max(1.0);
         let baseline = ((h - (m.ascent + m.descent)) / 2.0 + m.ascent).round();
         Metrics { w, h, baseline, px }
+    }
+
+    /// Fits the cell size to the tallest grid on screen, once its height has held still for a
+    /// moment (a divider drag or a window resize doesn't make the text shimmer).
+    fn refit(&mut self) {
+        if self.spec.fit <= 0.0 {
+            self.fitted = None;
+            self.fit_seen = None;
+            *FITTED.lock().unwrap() = None;
+            return;
+        }
+        let tallest = self
+            .panes
+            .iter()
+            .filter(|(id, _)| self.last_seen.contains(id))
+            .filter_map(|(_, p)| p.site)
+            .map(|s| (s.rect[3] - 2.0 * (self.spec.padding * s.scale).round(), s.scale))
+            .fold(None, |a: Option<(f32, f32)>, b| if a.is_none_or(|a| b.0 > a.0) { Some(b) } else { a });
+        let Some((target, scale)) = tallest.filter(|t| t.0 > 0.0) else { return };
+        match self.fit_seen {
+            Some((t, since)) if (t - target).abs() < 0.5 => {
+                let done = self.fitted.is_some_and(|f| (f.0 - target).abs() < 0.5);
+                if done {
+                    return;
+                }
+                if self.time - since < 0.15 {
+                    self.moving = true; // come back to fit once it settles
+                    return;
+                }
+                let base = self.base_px(scale);
+                let (spec, extra) = (&self.spec, self.spec.cell_height_px * scale);
+                let (px, h) = fit(target, base, spec.cell_height, extra, spec.fit, |px| self.natural(px));
+                self.fitted = Some((target, px, h));
+                let own = (self.natural(base) * (1.0 + spec.cell_height) + extra).round().max(1.0);
+                // Only worth showing when it changed something.
+                let changed = px != base || (h - own).abs() >= 0.5;
+                *FITTED.lock().unwrap() = changed.then(|| (px / (96.0 / 72.0 * scale), (h / own - 1.0) * 100.0));
+            }
+            _ => {
+                self.fit_seen = Some((target, self.time));
+                self.moving = true;
+            }
+        }
     }
 
     /// Builds one row's instances.
@@ -781,11 +904,12 @@ impl GridRenderer {
     }
 
     fn metrics_at(&mut self, scale: f32) -> Metrics {
+        let (px, h) = self.cell_size(scale);
         match self.metrics {
-            Some(m) if (m.px - (self.spec.size * 96.0 / 72.0 * scale).round()).abs() < 0.5 => m,
+            Some(m) if (m.px - px).abs() < 0.5 && (m.h - h).abs() < 0.5 => m,
             _ => {
-                // New scale: new glyphs, and every pane redraws in full.
-                let m = self.metrics_for(scale);
+                // New scale (or fit): new glyphs, and every pane redraws in full.
+                let m = self.metrics_with(px, h);
                 self.metrics = Some(m);
                 self.atlas = Atlas::new();
                 for p in self.panes.values_mut() {
@@ -1155,6 +1279,7 @@ impl Compositor<State> for GridRenderer {
         self.time += f.dt.clamp(0.0, 0.1);
         self.frame += 1;
         self.moving = false;
+        self.refit();
         let clear = f.rt.clear_color();
         f.ui.prepare(f.device, f.queue, &mut f.rt.text.atlas, &f.rt.instances, f.size);
 
@@ -1249,5 +1374,53 @@ impl Compositor<State> for GridRenderer {
 
     fn animating(&self) -> bool {
         self.moving
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A font whose own line height is 1.2× its size.
+    fn natural(px: f32) -> f32 {
+        px * 1.2
+    }
+
+    #[test]
+    fn no_fit_keeps_the_configured_size() {
+        // 30 px at 30% more line height: a 47 px cell (46.8 rounded).
+        assert_eq!(fit(1000.0, 30.0, 0.3, 0.0, 0.0, natural), (30.0, 47.0));
+    }
+
+    #[test]
+    fn a_fit_leaves_no_strip_when_it_can() {
+        // No cell within 5% divides 1000 exactly: the fit leaves the least of any of them.
+        let (_, h) = fit(1000.0, 30.0, 0.3, 0.0, 0.05, natural);
+        let left = 1000.0 % h;
+        for other in 45..=49 {
+            assert!(left <= 1000.0 % other as f32 + 0.5, "{h} leaves {left}, {other} leaves less");
+        }
+        // 1288 = 28 × 46: reachable, so nothing is left.
+        let (_, h) = fit(1288.0, 30.0, 0.3, 0.0, 0.05, natural);
+        assert_eq!(1288.0 % h, 0.0, "{h}");
+    }
+
+    #[test]
+    fn spacing_moves_before_the_letters_do() {
+        // 940 = 20 × 47: the configured cell already fits; nothing changes.
+        assert_eq!(fit(940.0, 30.0, 0.3, 0.0, 0.05, natural), (30.0, 47.0));
+        // 900 = 20 × 45: a line height change alone does it, so the font size stays.
+        assert_eq!(fit(900.0, 30.0, 0.3, 0.0, 0.05, natural).0, 30.0);
+    }
+
+    #[test]
+    fn a_fit_stays_within_its_bounds() {
+        for target in (300..2000).step_by(37) {
+            let (px, h) = fit(target as f32, 30.0, 0.3, 0.0, 0.03, natural);
+            assert!((29.0..=30.9).contains(&px), "{px}");
+            let own = natural(px) * 1.3;
+            let inside = h >= (own * 0.97).ceil() && h <= (own * 1.03).floor();
+            assert!(inside || (px, h) == (30.0, 47.0), "{target}: {h} vs {own}");
+        }
     }
 }

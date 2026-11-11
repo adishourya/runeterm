@@ -87,7 +87,7 @@ impl Default for Config {
         ]
         .map(|h| rgb(h).unwrap());
         Config {
-            font: FontSpec { family: "monospace".into(), size: 13.0, cell_height: 0.0, cell_height_px: 0.0, padding: 10.0 },
+            font: FontSpec { family: "monospace".into(), size: 13.0, cell_height: 0.0, cell_height_px: 0.0, padding: 10.0, fit: 0.0 },
             theme: Theme { fg: Rgb(255, 255, 255), bg: Rgb(0x10, 0x10, 0x10), cursor: Rgb(0xcc, 0xcc, 0xcc), ansi, cursor_style: CursorStyle::Bar },
             cursor_style: CursorStyle::Bar,
             cursor_opacity: 1.0,
@@ -186,6 +186,7 @@ impl Config {
         } else {
             format!("{}%", (f.cell_height * 100.0).round())
         };
+        let fit = (f.fit * 100.0).round();
         let style = match self.cursor_style {
             CursorStyle::Block => "block",
             CursorStyle::Underline => "underline",
@@ -213,6 +214,10 @@ impl Config {
              font-size = {}\n\
              # Extra space between lines: a percentage (31%) or pixels (4).\n\
              line-height = {line_height}\n\
+             # Let the line height (and, if that's not enough, the font size) move by up to\n\
+             # this much so the lines fill the split, with no blank strip under the last one.\n\
+             # 0% keeps them exact.\n\
+             font-size-fit = {fit}%\n\
              # Space between a split's edge and its text, in points.\n\
              padding = {}\n\
              \n\
@@ -316,6 +321,11 @@ impl Config {
                     }
                 }
                 "padding" | "window-padding" => self.font.padding = v.parse().unwrap_or(self.font.padding),
+                "font-size-fit" => {
+                    if let Ok(p) = v.trim_end_matches('%').trim().parse::<f32>() {
+                        self.font.fit = (p / 100.0).clamp(0.0, 0.15);
+                    }
+                }
                 "background" => self.theme.bg = rgb(v).unwrap_or(self.theme.bg),
                 "foreground" => self.theme.fg = rgb(v).unwrap_or(self.theme.fg),
                 "cursor-color" => self.theme.cursor = rgb(v).unwrap_or(self.theme.cursor),
