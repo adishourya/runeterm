@@ -47,6 +47,9 @@ closed_by_user: bool = false,
 /// The user closed its split or tab while the client in it was still
 /// running: hang up once that client goes away. See `sessions.handleClosed`.
 close_on_detach: bool = false,
+/// When `close_on_detach` was set (ms): a client that hasn't gone a moment
+/// later is hung up anyway; see `Server.hangUpClosed`.
+closed_ms: i64 = 0,
 
 /// Output arrived since the last snapshot was written to disk.
 dirty: bool = true,

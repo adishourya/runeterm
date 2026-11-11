@@ -48,6 +48,11 @@ const snapshot_interval_ms = 10_000;
 /// How long a `prepare` waits for a ghostty window to show up and claim it.
 const prepare_timeout_ms = 30_000;
 
+/// A pane closed while its client still shows it is hung up once the client
+/// goes; if the client is still there after this long, it is hung up anyway,
+/// so a controller that keeps the connection can't keep a closed pane alive.
+const closed_grace_ms = 3_000;
+
 /// A pane whose shell exited normally is forgotten only after this long.
 /// During shutdown the shells can be killed a moment before the daemon
 /// gets its own SIGTERM, and they must still come back after the reboot.
@@ -256,6 +261,7 @@ fn tick(self: *Server) !void {
     if (resuming) self.resumeCommands();
     self.reap();
     self.sweep();
+    self.hangUpClosed();
     sessionpkg.sendSurfaces(self);
     if (nowMs() - self.last_save_ms >= save_interval_ms) self.save(false);
 }
@@ -371,6 +377,20 @@ fn sweep(self: *Server) void {
     }
 
     sessionpkg.prune(self);
+}
+
+/// Hang up panes closed a while ago whose client never went; see
+/// `closed_grace_ms`.
+fn hangUpClosed(self: *Server) void {
+    const now = nowMs();
+    for (self.panes.items) |pane| {
+        if (pane.dead or !pane.close_on_detach or pane.client == null) continue;
+        if (now - pane.closed_ms < closed_grace_ms) continue;
+        log.info("pane {d} closed {d} ms ago but still shown; hanging up", .{ pane.id, now - pane.closed_ms });
+        // Once: it ends as the signal lands.
+        pane.close_on_detach = false;
+        pane.hangup();
+    }
 }
 
 /// Keep a dead pane's last known state around; see `Departed`.
@@ -887,7 +907,9 @@ fn save(self: *Server, all: bool) void {
     var entries: std.ArrayList(persist.PaneState) = .empty;
     defer entries.deinit(self.gpa);
     for (self.panes.items) |pane| {
-        if (pane.dead) continue;
+        // A pane the user closed is on its way out: never save it, so it can't
+        // come back after a crash or reboot.
+        if (pane.dead or pane.close_on_detach) continue;
         const fg = pane.fg orelse continue;
         var ps = paneState(pane.id, pane.session, pane.size, fg);
         if (fg.argv == null) ps.pending_resume = pane.resume_cmd;
@@ -1009,7 +1031,7 @@ fn wipeState(self: *Server) void {
     _ = c.unlink(path.ptr);
 }
 
-fn nowMs() i64 {
+pub fn nowMs() i64 {
     var ts: c.struct_timespec = undefined;
     _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
     return @as(i64, ts.tv_sec) * 1000 + @divTrunc(@as(i64, ts.tv_nsec), 1_000_000);

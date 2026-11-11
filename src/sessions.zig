@@ -278,7 +278,10 @@ pub fn handleClosed(server: *Server, payload: []const u8) void {
             // Ghostty ends the client in a closed surface itself, as part of
             // closing it. Hanging up first would make that client exit while
             // ghostty is still tearing the surface down.
-            if (pane.client != null) pane.close_on_detach = true else pane.hangup();
+            if (pane.client != null) {
+                pane.close_on_detach = true;
+                pane.closed_ms = Server.nowMs();
+            } else pane.hangup();
         }
     }
 }
