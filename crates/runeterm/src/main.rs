@@ -2,6 +2,7 @@ mod accents;
 mod smooth;
 mod bench;
 mod config;
+mod exports;
 mod grid;
 mod icons;
 mod pane;

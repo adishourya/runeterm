@@ -147,6 +147,9 @@ pub struct State {
     pub accents: Vec<crate::vt::Rgb>,
     /// The session `accent` was looked up for.
     accent_for: Option<String>,
+    /// What this window last wrote to `~/.rune_state_exports`; cleared when it loses focus, so
+    /// coming back rewrites it over whatever another window wrote meanwhile.
+    exported: Option<crate::exports::Exports>,
     /// The spooky session this window is, once the daemon has named it.
     pub session: Option<Session>,
     /// The session whose emoji was last checked for being an animal (see `give_animal`).
@@ -248,6 +251,7 @@ impl State {
             default_accent: config.accent,
             accents: config.accents.clone(),
             accent_for: None,
+            exported: None,
             session: None,
             animal_checked: None,
             rename_edit: rune::TextEdit::new(""),
@@ -565,6 +569,7 @@ impl State {
         changed |= self.step_scrolling();
         changed |= self.follow_session_accent();
         self.give_animal();
+        self.export();
         let exited: Vec<u32> = self.panes.values().filter(|p| p.exited.load(Ordering::Acquire)).map(|p| p.id).collect();
         for id in exited {
             self.forget(id);
@@ -721,6 +726,20 @@ impl State {
 
     /// Takes the session's own accent once the session is known (a new one is given a colour no
     /// other session has), and the config's outside a session.
+    /// While this window has focus, keeps `~/.rune_state_exports` on its session and colours.
+    fn export(&mut self) {
+        if !self.window_focused {
+            self.exported = None;
+            return;
+        }
+        let Some(session) = &self.session else { return };
+        let now = crate::exports::Exports { session: session.name.clone(), animal: session.animal.clone(), accent: self.accent, light: self.light };
+        if self.exported.as_ref() != Some(&now) {
+            crate::exports::write(&now);
+            self.exported = Some(now);
+        }
+    }
+
     fn follow_session_accent(&mut self) -> bool {
         let name = self.session.as_ref().map(|s| s.name.clone());
         if name == self.accent_for {
