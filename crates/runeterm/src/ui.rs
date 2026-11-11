@@ -321,11 +321,25 @@ fn node(s: &State, tab: &Tab, n: &Node, path: Vec<bool>) -> El {
             c.key(format!("split-{}", path.iter().map(|b| if *b { '1' } else { '0' }).collect::<String>()))
                 .w_full().h_full().gap(look::GAP).min_w(0.0).min_h(0.0).motion(FAST)
                 .cursor(if across { Cursor::ResizeColumn } else { Cursor::ResizeRow })
-                .on_drag(move |s: &mut State, d: &mut Drag, tx: &mut Tx| {
-                    let (pos, len) = if across { (d.x, d.w) } else { (d.y, d.h) };
-                    let r = (pos - look::GAP / 2.0) / (len - look::GAP).max(1.0);
-                    s.set_ratio(&path, r);
-                    tx.instant();
+                .on_drag({
+                    let path = path.clone();
+                    move |s: &mut State, d: &mut Drag, tx: &mut Tx| {
+                        let (pos, len) = if across { (d.x, d.w) } else { (d.y, d.h) };
+                        let r = (pos - look::GAP / 2.0) / (len - look::GAP).max(1.0);
+                        s.set_ratio(&path, r);
+                        s.dragging_divider = !matches!(d.phase, Phase::Up);
+                        tx.instant();
+                    }
+                })
+                // Its length, for snapping the divider to whole lines.
+                .on_layout({
+                    let key = (tab.id, path.clone());
+                    move |s: &mut State, r: [f32; 4]| {
+                        let len = if across { r[2] } else { r[3] } - look::GAP;
+                        if s.split_lens.get(&key) != Some(&len) {
+                            s.split_lens.insert(key.clone(), len);
+                        }
+                    }
                 })
                 .child(wrap(node(s, tab, a, pa), *ratio))
                 .child(wrap(node(s, tab, b, pb), 1.0 - ratio))
@@ -1017,7 +1031,7 @@ pub fn spec() -> AppSpec<State> {
             let changed = s.poll(t);
             // The clock and battery change on their own: look again every few seconds. A pane
             // scrolling smoothly wants every frame.
-            let next = if s.scrolling() { 1.0 / 120.0 } else { 5.0 };
+            let next = if s.scrolling() { 1.0 / 120.0 } else if s.snap_pending() { 0.1 } else { 5.0 };
             tx.wake_after(std::time::Duration::from_secs_f64(next));
             changed
         }),
@@ -1030,6 +1044,15 @@ pub fn spec() -> AppSpec<State> {
                 // A screenful and more of output, to scroll back through.
                 if let Some(p) = s.focused_id().and_then(|id| s.panes.get(&id)) {
                     p.send(b"seq 1 300\n");
+                }
+            }),
+            ("stacked", |s| {
+                // Two splits, one above the other, both full of numbers.
+                s.split(Dir::Down);
+                for id in s.tabs[0].root.leaves() {
+                    if let Some(p) = s.panes.get(&id) {
+                        p.send(b"seq 1 300\n");
+                    }
                 }
             }),
             ("floating", |s| {

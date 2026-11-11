@@ -787,23 +787,43 @@ impl GridRenderer {
         Metrics { w, h, baseline, px }
     }
 
-    /// Fits the cell size to the tallest grid on screen, once its height has held still for a
-    /// moment (a divider drag or a window resize doesn't make the text shimmer).
-    fn refit(&mut self) {
+    /// The height of text a column of the shown tab holds (device px): a split's own, splits
+    /// stacked one above another added up, the tallest of splits side by side. Moving a divider
+    /// doesn't change it, so once the dividers snap to whole lines, every split in the column
+    /// comes out whole.
+    fn column_height(&self, s: &State) -> Option<(f32, f32)> {
+        let tab = s.tab()?;
+        let slot = |id: u32| {
+            let site = self.panes.get(&id).filter(|_| self.last_seen.contains(&id))?.site?;
+            Some((site.rect[3] - 2.0 * (self.spec.padding * site.scale).round(), site.scale))
+        };
+        fn walk(n: &crate::split::Node, slot: &dyn Fn(u32) -> Option<(f32, f32)>) -> Option<(f32, f32)> {
+            use crate::split::{Dir, Node};
+            match n {
+                Node::Leaf(id) => slot(*id),
+                Node::Split { dir: Dir::Down, a, b, .. } => {
+                    let (a, b) = (walk(a, slot)?, walk(b, slot)?);
+                    Some((a.0 + b.0, a.1))
+                }
+                Node::Split { a, b, .. } => match (walk(a, slot), walk(b, slot)) {
+                    (Some(a), Some(b)) => Some(if a.0 >= b.0 { a } else { b }),
+                    (a, b) => a.or(b),
+                },
+            }
+        }
+        if tab.zoomed { slot(tab.focused) } else { walk(&tab.root, &slot) }
+    }
+
+    /// Fits the cell size to the shown tab's columns (see `column_height`), once their height
+    /// has held still for a moment (a window resize doesn't make the text shimmer).
+    fn refit(&mut self, state: &State) {
         if self.spec.fit <= 0.0 {
             self.fitted = None;
             self.fit_seen = None;
             *FITTED.lock().unwrap() = None;
             return;
         }
-        let tallest = self
-            .panes
-            .iter()
-            .filter(|(id, _)| self.last_seen.contains(id))
-            .filter_map(|(_, p)| p.site)
-            .map(|s| (s.rect[3] - 2.0 * (self.spec.padding * s.scale).round(), s.scale))
-            .fold(None, |a: Option<(f32, f32)>, b| if a.is_none_or(|a| b.0 > a.0) { Some(b) } else { a });
-        let Some((target, scale)) = tallest.filter(|t| t.0 > 0.0) else { return };
+        let Some((target, scale)) = self.column_height(state).filter(|t| t.0 > 0.0) else { return };
         match self.fit_seen {
             Some((t, since)) if (t - target).abs() < 0.5 => {
                 let done = self.fitted.is_some_and(|f| (f.0 - target).abs() < 0.5);
@@ -1279,7 +1299,7 @@ impl Compositor<State> for GridRenderer {
         self.time += f.dt.clamp(0.0, 0.1);
         self.frame += 1;
         self.moving = false;
-        self.refit();
+        self.refit(&f.rt.state);
         let clear = f.rt.clear_color();
         f.ui.prepare(f.device, f.queue, &mut f.rt.text.atlas, &f.rt.instances, f.size);
 

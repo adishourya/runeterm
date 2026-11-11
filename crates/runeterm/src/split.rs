@@ -69,6 +69,15 @@ impl Node {
         }
     }
 
+    /// The leaf along the far edge of this subtree in `dir` (the bottom one for `Down`, the
+    /// right one for `Right`): the one whose leftover space sits against a divider after it.
+    pub fn edge_leaf(&self, dir: Dir) -> u32 {
+        match self {
+            Node::Leaf(id) => *id,
+            Node::Split { dir: d, a, b, .. } => if *d == dir { b.edge_leaf(dir) } else { a.edge_leaf(dir) },
+        }
+    }
+
     /// Sets the ratio of the split at `path` (false: into `a`, true: into `b`).
     pub fn set_ratio(&mut self, path: &[bool], r: f32) {
         if let Node::Split { ratio, a, b, .. } = self {
@@ -197,6 +206,20 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_edge_leaf_is_the_one_against_the_next_divider() {
+        // [1 | [2 / 3]]: going down, the bottom of the right column is 3; going across, the
+        // right edge of the whole thing is the right column's first leaf.
+        let mut n = Node::Leaf(1);
+        n.split(1, 2, Dir::Right);
+        n.split(2, 3, Dir::Down);
+        assert_eq!(n.edge_leaf(Dir::Right), 2);
+        assert_eq!(n.edge_leaf(Dir::Down), 1);
+        if let Node::Split { b, .. } = &n {
+            assert_eq!(b.edge_leaf(Dir::Down), 3);
+        }
+    }
 
     fn three() -> Node {
         // 1 | 2

@@ -60,7 +60,9 @@ spooky too.
 - Settings: `~/.config/runeterm/config` (written from Ghostty's on first run). ⌥R reloads.
 - `font-size-fit = 3%` lets the line height (and, if that's not enough, the font size) move by
   up to that much so the lines fill the splits with no blank strip under the last one; the
-  appearance section shows what it chose. 0 (the default) keeps them exact.
+  appearance section shows what it chose. 0 (the default) keeps them exact. Dividers snap to
+  whole lines and columns once you let go of them (or the window settles), so a split never
+  ends in a part of a line; with `font-size-fit` the last split in a column comes out whole too.
 - Keys: ⌥[ / ⌥- split, ⌥h/j/k/l focus, ⌥⇧h/j/k/l swap, ⌥w/a/s/d resize, ⌥Z (or ⌥↩) full screen, ⌥M minimize,
   ⌥F float or dock (drag a floating split by its header, resize it from its corner), ⌥X close, ⌥T new tab, ⌥1–9 tabs, ⌥/ pin or unpin the sidebar, ⌥E open the scrollback in
   an editor (`scrollback-editor`).

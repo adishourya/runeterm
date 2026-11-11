@@ -160,6 +160,13 @@ pub struct State {
     wheel_rest: HashMap<u32, f32>,
     /// The size of the area the splits are laid out in (points), for floating splits.
     pub stage: [f32; 2],
+    /// Each split's length along its direction, less the gap (points), by (tab, path): to turn a
+    /// distance into a ratio when snapping dividers to whole lines.
+    pub split_lens: HashMap<(u32, Vec<bool>), f32>,
+    /// A divider is being dragged: no snapping until it's let go.
+    pub dragging_divider: bool,
+    /// The snaps planned, and since when the plan has held (they wait for the layout to rest).
+    snap_seen: Option<(Vec<(Vec<bool>, i32)>, f64)>,
     /// Smooth scrolling through each pane's scrollback, while it moves.
     scrollers: HashMap<u32, crate::smooth::Scroller>,
     /// The app's clock at the last poll (seconds), for scrolling's timing.
@@ -259,6 +266,9 @@ impl State {
             picker_accents: HashMap::new(),
             wheel_rest: HashMap::new(),
             scrollers: HashMap::new(),
+            split_lens: HashMap::new(),
+            dragging_divider: false,
+            snap_seen: None,
             stage: [1.0, 1.0],
             now: 0.0,
             window_focused: true,
@@ -567,6 +577,7 @@ impl State {
         self.now = t;
         changed |= self.handle_events();
         changed |= self.step_scrolling();
+        changed |= self.snap_dividers(t);
         changed |= self.follow_session_accent();
         self.give_animal();
         self.export();
@@ -1423,6 +1434,69 @@ impl State {
         if let Some(tab) = self.tabs.get_mut(self.active) {
             tab.root.set_ratio(path, ratio.clamp(0.08, 0.92));
         }
+    }
+
+    /// Where each divider of the shown tab would go so the split before it holds a whole number
+    /// of lines (or, across, columns): (path, new ratio), for those that are off by a pixel or
+    /// more. The split after a divider takes up the difference.
+    fn planned_snaps(&self) -> Vec<(Vec<bool>, f32)> {
+        let Some(tab) = self.tab().filter(|t| !t.zoomed) else { return vec![] };
+        fn walk(s: &State, tab: &Tab, n: &Node, path: Vec<bool>, out: &mut Vec<(Vec<bool>, f32)>) {
+            let Node::Split { dir, ratio, a, b } = n else { return };
+            let leaf = a.edge_leaf(*dir);
+            if let (Some(g), Some(len)) = (crate::grid::geometry(leaf), s.split_lens.get(&(tab.id, path.clone()))) {
+                let (extent, cell) = match dir {
+                    Dir::Down => (g.height - 2.0 * g.pad, g.cell_h),
+                    Dir::Right => (g.width - 2.0 * g.pad, g.cell_w),
+                };
+                if cell > 0.0 && extent > cell {
+                    let left = extent - (extent / cell).floor() * cell;
+                    // The nearer whole line: give up the leftover, or grow to the next line.
+                    let by = if left > cell / 2.0 { cell - left } else { -left };
+                    let to = (ratio + by / g.scale / len.max(1.0)).clamp(0.08, 0.92);
+                    if by.abs() >= 1.0 && (to - ratio).abs() > 1e-4 {
+                        out.push((path.clone(), to));
+                    }
+                }
+            }
+            walk(s, tab, a, [path.clone(), vec![false]].concat(), out);
+            walk(s, tab, b, [path, vec![true]].concat(), out);
+        }
+        let mut out = vec![];
+        walk(self, tab, &tab.root, vec![], &mut out);
+        out
+    }
+
+    /// Moves the dividers onto whole lines once the layout has rested for a moment (not while
+    /// one is dragged, nor mid-animation). Returns whether any moved.
+    fn snap_dividers(&mut self, t: f64) -> bool {
+        let plan = if self.dragging_divider { vec![] } else { self.planned_snaps() };
+        if plan.is_empty() {
+            self.snap_seen = None;
+            return false;
+        }
+        let key: Vec<(Vec<bool>, i32)> = plan.iter().map(|(p, r)| (p.clone(), (r * 10_000.0).round() as i32)).collect();
+        match &self.snap_seen {
+            Some((seen, since)) if *seen == key => {
+                if t - since < 0.25 {
+                    return false;
+                }
+                for (path, r) in plan {
+                    self.set_ratio(&path, r);
+                }
+                self.snap_seen = None;
+                true
+            }
+            _ => {
+                self.snap_seen = Some((key, t));
+                false
+            }
+        }
+    }
+
+    /// Dividers are waiting to snap: come back soon.
+    pub fn snap_pending(&self) -> bool {
+        self.snap_seen.is_some()
     }
 
     /// Desktop notifications for splits that want attention while the user can't see them:
