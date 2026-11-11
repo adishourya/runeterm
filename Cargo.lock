@@ -2854,6 +2854,7 @@ dependencies = [
  "bytemuck",
  "chrono",
  "ghostty-vt-sys",
+ "libc",
  "png 0.18.1",
  "portable-pty",
  "rune",

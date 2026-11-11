@@ -99,7 +99,26 @@ pub struct Pane {
 }
 
 impl Drop for Pane {
+    /// A pane leaving the window lets go of what it runs on. Its reader thread holds its own
+    /// handle (a copy of the socket, or of the pty), so dropping ours alone would close nothing:
+    /// spooky would keep a closed split's pane alive, attached to no one's view, and save it
+    /// (a reboot brought it back as an extra tab), and a local shell would run on.
     fn drop(&mut self) {
+        match &self.backend {
+            // Shut the socket itself down: every handle to it sees the end, so the reader
+            // thread stops and spooky sees this view go (and ends the pane if it was closed).
+            Backend::Spooky { stream } => {
+                if let Ok(s) = stream.lock() {
+                    let _ = s.shutdown(std::net::Shutdown::Both);
+                }
+            }
+            // Hang up the shell as closing a terminal does; its pty then ends the reader.
+            Backend::Local { shell_pid: Some(pid), .. } => {
+                // SAFETY: kill() only sends a signal, to the shell's process group.
+                unsafe { libc::kill(-(*pid as i32), libc::SIGHUP) };
+            }
+            Backend::Local { .. } => {}
+        }
         if let Some(p) = &self.cleanup {
             let _ = std::fs::remove_file(p);
         }
