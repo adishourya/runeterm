@@ -231,6 +231,8 @@ fn execChild(master: c_int, slave: c_int, opts: Options) noreturn {
         }
     }
 
+    setTermEnv();
+
     var id_buf: [16]u8 = undefined;
     const id_str = std.fmt.bufPrintSentinel(&id_buf, "{d}", .{opts.id}, 0) catch unreachable;
     _ = c.setenv("SPOOKY_PANE", id_str.ptr, 1);
@@ -257,6 +259,144 @@ fn execChild(master: c_int, slave: c_int, opts: Options) noreturn {
     const argv = [_:null]?[*:0]const u8{ shell, null };
     _ = c.execvp(shell, @ptrCast(&argv));
     c._exit(127);
+}
+
+/// Describes the terminal to the pane's programs. Panes are shown by Ghostty
+/// (or a libghostty terminal), but the daemon's own environment is whatever
+/// it was started with, often `TERM=linux` from a login console or a service
+/// manager, which would make programs think they run on the Linux console.
+fn setTermEnv() void {
+    var dir_buf: [4096]u8 = undefined;
+    if (findTerminfo(&dir_buf)) |found| {
+        _ = c.setenv("TERM", "xterm-ghostty", 1);
+        // Point programs at an entry outside the default search path, like
+        // Ghostty does with its own resources.
+        if (found.dir) |dir| _ = c.setenv("TERMINFO", dir, 1);
+    } else {
+        // A TERM without a terminfo entry breaks programs; this one is
+        // everywhere and close enough.
+        _ = c.setenv("TERM", "xterm-256color", 1);
+    }
+    _ = c.setenv("COLORTERM", "truecolor", 1);
+    _ = c.setenv("TERM_PROGRAM", "ghostty", 1);
+}
+
+const Terminfo = struct {
+    /// The directory to set as TERMINFO, null if programs find it already.
+    dir: ?[*:0]const u8,
+};
+
+/// Looks for the `xterm-ghostty` terminfo entry where ncurses looks for it,
+/// then where Ghostty installs it.
+fn findTerminfo(dir_buf: []u8) ?Terminfo {
+    const home: []const u8 = if (c.getenv("HOME")) |home| std.mem.span(home) else "";
+    var found_default = false;
+    // Found by programs without TERMINFO: $TERMINFO, ~/.terminfo,
+    // $TERMINFO_DIRS and the system directories.
+    if (c.getenv("TERMINFO")) |dir| found_default = hasEntry(std.mem.span(dir));
+    if (!found_default and home.len > 0) {
+        var buf: [4096]u8 = undefined;
+        if (std.fmt.bufPrint(&buf, "{s}/.terminfo", .{home})) |dir| found_default = hasEntry(dir) else |_| {}
+    }
+    if (!found_default) if (c.getenv("TERMINFO_DIRS")) |dirs| {
+        var it = std.mem.tokenizeScalar(u8, std.mem.span(dirs), ':');
+        while (it.next()) |dir| if (hasEntry(dir)) {
+            found_default = true;
+            break;
+        };
+    };
+    if (!found_default) for ([_][]const u8{
+        "/etc/terminfo",
+        "/lib/terminfo",
+        "/usr/share/terminfo",
+        "/usr/lib/terminfo",
+    }) |dir| if (hasEntry(dir)) {
+        found_default = true;
+        break;
+    };
+    if (found_default) return .{ .dir = null };
+
+    // Where Ghostty installs it when installed to ~/.local (or with
+    // XDG_DATA_HOME), and next to its resources.
+    var candidates: [3][]const u8 = undefined;
+    var count: usize = 0;
+    var bufs: [3][4096]u8 = undefined;
+    if (c.getenv("XDG_DATA_HOME")) |data| {
+        if (std.fmt.bufPrint(&bufs[count], "{s}/terminfo", .{std.mem.span(data)})) |dir| {
+            candidates[count] = dir;
+            count += 1;
+        } else |_| {}
+    }
+    if (home.len > 0) {
+        if (std.fmt.bufPrint(&bufs[count], "{s}/.local/share/terminfo", .{home})) |dir| {
+            candidates[count] = dir;
+            count += 1;
+        } else |_| {}
+    }
+    if (c.getenv("GHOSTTY_RESOURCES_DIR")) |resources| {
+        if (std.fmt.bufPrint(&bufs[count], "{s}/../terminfo", .{std.mem.span(resources)})) |dir| {
+            candidates[count] = dir;
+            count += 1;
+        } else |_| {}
+    }
+    for (candidates[0..count]) |dir| {
+        if (!hasEntry(dir)) continue;
+        const path = std.fmt.bufPrintSentinel(dir_buf, "{s}", .{dir}, 0) catch continue;
+        return .{ .dir = path.ptr };
+    }
+    return null;
+}
+
+/// Whether the terminfo directory `dir` has an `xterm-ghostty` entry, in
+/// either layout (`x/` or, on macOS, the hex `78/`).
+fn hasEntry(dir: []const u8) bool {
+    var buf: [4096]u8 = undefined;
+    for ([_][]const u8{ "x", "78" }) |sub| {
+        const path = std.fmt.bufPrintSentinel(&buf, "{s}/{s}/xterm-ghostty", .{ dir, sub }, 0) catch continue;
+        if (c.access(path.ptr, c.R_OK) == 0) return true;
+    }
+    return false;
+}
+
+test findTerminfo {
+    const tmp = "/tmp/spooky-terminfo-test";
+    _ = c.mkdir(tmp, 0o755);
+    _ = c.mkdir(tmp ++ "/.local", 0o755);
+    _ = c.mkdir(tmp ++ "/.local/share", 0o755);
+    _ = c.mkdir(tmp ++ "/.local/share/terminfo", 0o755);
+    _ = c.mkdir(tmp ++ "/.local/share/terminfo/x", 0o755);
+    const file = c.fopen(tmp ++ "/.local/share/terminfo/x/xterm-ghostty", "w");
+    if (file) |f| _ = c.fclose(f);
+    defer {
+        _ = c.unlink(tmp ++ "/.local/share/terminfo/x/xterm-ghostty");
+        _ = c.rmdir(tmp ++ "/.local/share/terminfo/x");
+        _ = c.rmdir(tmp ++ "/.local/share/terminfo");
+        _ = c.rmdir(tmp ++ "/.local/share");
+        _ = c.rmdir(tmp ++ "/.local");
+        _ = c.rmdir(tmp);
+    }
+
+    try std.testing.expect(hasEntry(tmp ++ "/.local/share/terminfo"));
+    try std.testing.expect(!hasEntry(tmp));
+
+    // Only test the fallback to ~/.local/share/terminfo when the system has
+    // no entry, which would win.
+    const vars = [_][*:0]const u8{ "HOME", "TERMINFO", "TERMINFO_DIRS", "XDG_DATA_HOME", "GHOSTTY_RESOURCES_DIR" };
+    var saved: [vars.len]?[]const u8 = undefined;
+    for (vars, &saved) |name, *value| value.* = if (c.getenv(name)) |v| try std.testing.allocator.dupe(u8, std.mem.span(v)) else null;
+    defer for (vars, saved) |name, value| {
+        if (value) |v| {
+            const z = std.testing.allocator.dupeSentinel(u8, v, 0) catch unreachable;
+            defer std.testing.allocator.free(z);
+            _ = c.setenv(name, z.ptr, 1);
+            std.testing.allocator.free(v);
+        } else _ = c.unsetenv(name);
+    };
+    for (vars) |name| _ = c.unsetenv(name);
+    _ = c.setenv("HOME", tmp, 1);
+    var buf: [4096]u8 = undefined;
+    const found = findTerminfo(&buf) orelse return error.NotFound;
+    if (found.dir) |dir| try std.testing.expectEqualStrings(tmp ++ "/.local/share/terminfo", std.mem.span(dir));
 }
 
 fn writePty(

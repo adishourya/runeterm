@@ -146,6 +146,7 @@ fn fatalCode(msg: []const u8) u8 {
 }
 
 test {
+    _ = @import("Pane.zig");
     _ = @import("protocol.zig");
     _ = @import("persist.zig");
     _ = @import("layout.zig");
