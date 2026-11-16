@@ -27,8 +27,9 @@ cargo build --release -p runeterm
 Set `GHOSTTY_VT_PREFIX` to use a libghostty-vt installed elsewhere. Building the bindings needs
 libclang.
 
-Sessions need a `spooky` that accepts several controllers (the `spooky-multi-controller`
-branch); without a daemon, runeterm runs plain local shells (`RUNETERM_LOCAL=1` forces that).
+Sessions need the `spooky` in [`spooky/`](spooky/), which accepts several controllers; build it
+after libghostty-vt with `cd spooky && zig build -Doptimize=ReleaseFast` (see its README). Without
+a daemon, runeterm runs plain local shells (`RUNETERM_LOCAL=1` forces that).
 
 ## Performance
 

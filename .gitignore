@@ -1,3 +1,5 @@
 /target
 /vendor/ghostty
 /vendor/ghostty-vt
+/spooky/.zig-cache
+/spooky/zig-out

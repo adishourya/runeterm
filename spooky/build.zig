@@ -6,14 +6,15 @@ pub fn build(b: *std.Build) void {
 
     // spooky links a prebuilt libghostty-vt rather than depending on the
     // ghostty package so that iterating on spooky never rebuilds ghostty.
-    // Build it once from the repo root with `zig build -Demit-lib-vt`.
-    const ghostty_root = b.option(
+    // By default it's the one runeterm builds into ../vendor/ghostty-vt
+    // (see the README); like runeterm, GHOSTTY_VT_PREFIX overrides it.
+    const vt_prefix = b.option(
         []const u8,
-        "ghostty",
-        "Path to the ghostty checkout (default: ..)",
-    ) orelse "..";
-    const ghostty_include = b.pathJoin(&.{ ghostty_root, "include" });
-    const ghostty_lib = b.pathJoin(&.{ ghostty_root, "zig-out", "lib" });
+        "vt-prefix",
+        "Where libghostty-vt is installed (default: $GHOSTTY_VT_PREFIX or ../vendor/ghostty-vt)",
+    ) orelse b.graph.environ_map.get("GHOSTTY_VT_PREFIX") orelse "../vendor/ghostty-vt";
+    const ghostty_include = b.pathJoin(&.{ vt_prefix, "include" });
+    const ghostty_lib = b.pathJoin(&.{ vt_prefix, "lib" });
 
     const c = b.addTranslateC(.{
         .root_source_file = b.path("src/c.h"),

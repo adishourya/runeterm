@@ -360,32 +360,30 @@ pub fn resize(self: *Pane, size: protocol.Size) void {
 /// `freeBuf`.
 pub fn replay(self: *Pane) ![]u8 {
     self.catchUp(null);
-    var opts = std.mem.zeroes(c.GhosttyFormatterTerminalOptions);
-    opts.size = @sizeOf(c.GhosttyFormatterTerminalOptions);
-    opts.emit = c.GHOSTTY_FORMATTER_FORMAT_VT;
-    // Keep trailing blank rows so the absolute cursor position lines up.
-    opts.trim = false;
-    opts.extra.size = @sizeOf(c.GhosttyFormatterTerminalExtra);
-    // The palette is left alone so the user's theme wins.
-    opts.extra.modes = true;
-    opts.extra.scrolling_region = true;
-    opts.extra.tabstops = true;
-    opts.extra.pwd = true;
-    opts.extra.keyboard = true;
-    opts.extra.screen = .{
-        .size = @sizeOf(c.GhosttyFormatterScreenExtra),
-        .cursor = true,
-        .style = true,
-        .hyperlink = true,
-        .protection = true,
-        .kitty_keyboard = true,
-        .charsets = true,
-    };
-
     var formatter: c.GhosttyFormatter = null;
-    if (c.ghostty_formatter_terminal_new(null, &formatter, self.term, opts) != c.GHOSTTY_SUCCESS)
+    if (c.ghostty_formatter_terminal_new(null, &formatter, self.term) != c.GHOSTTY_SUCCESS)
         return error.FormatterInit;
     defer c.ghostty_formatter_free(formatter);
+
+    const emit: c.GhosttyFormatterFormat = c.GHOSTTY_FORMATTER_FORMAT_VT;
+    // Keep trailing blank rows so the absolute cursor position lines up.
+    const trim = false;
+    // The palette is left alone so the user's theme wins.
+    const extras: c.GhosttyFormatterExtras = c.GHOSTTY_FORMATTER_EXTRA_MODES |
+        c.GHOSTTY_FORMATTER_EXTRA_SCROLLING_REGION |
+        c.GHOSTTY_FORMATTER_EXTRA_TABSTOPS |
+        c.GHOSTTY_FORMATTER_EXTRA_PWD |
+        c.GHOSTTY_FORMATTER_EXTRA_KEYBOARD |
+        c.GHOSTTY_FORMATTER_EXTRA_CURSOR |
+        c.GHOSTTY_FORMATTER_EXTRA_STYLE |
+        c.GHOSTTY_FORMATTER_EXTRA_HYPERLINK |
+        c.GHOSTTY_FORMATTER_EXTRA_PROTECTION |
+        c.GHOSTTY_FORMATTER_EXTRA_KITTY_KEYBOARD |
+        c.GHOSTTY_FORMATTER_EXTRA_CHARSETS;
+    if (c.ghostty_formatter_set(formatter, c.GHOSTTY_FORMATTER_OPT_EMIT, &emit) != c.GHOSTTY_SUCCESS or
+        c.ghostty_formatter_set(formatter, c.GHOSTTY_FORMATTER_OPT_TRIM, &trim) != c.GHOSTTY_SUCCESS or
+        c.ghostty_formatter_set(formatter, c.GHOSTTY_FORMATTER_OPT_EXTRAS, &extras) != c.GHOSTTY_SUCCESS)
+        return error.FormatterInit;
 
     var ptr: [*c]u8 = null;
     var len: usize = 0;

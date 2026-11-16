@@ -17,14 +17,16 @@ ghostty tab/split ──pty──> spooky (proxy) ──unix socket──> spook
 
 ## Build
 
-spooky links a prebuilt libghostty-vt, so working on spooky never rebuilds
-Ghostty. Build the library once from the repo root:
+spooky links a prebuilt libghostty-vt: the one runeterm builds into
+`../vendor/ghostty-vt` (see runeterm's README), or the one in
+`$GHOSTTY_VT_PREFIX` or `-Dvt-prefix=...` (a directory with `include/` and
+`lib/libghostty-vt.a`).
 
 ```sh
-zig build -Demit-lib-vt -Doptimize=ReleaseFast   # from the ghostty root
 cd spooky
-zig build                                        # warm rebuilds take about 1s
+zig build -Doptimize=ReleaseFast   # warm rebuilds take about 1s
 zig build test
+cp zig-out/bin/spooky ~/.local/bin/
 ```
 
 Use the ReleaseFast library. A Debug libghostty-vt runs expensive integrity
@@ -32,13 +34,8 @@ checks and parses output far too slowly for a daemon. Build the spooky you
 actually run in ReleaseFast too (`zig build -Doptimize=ReleaseFast`); the
 default Debug build uses noticeably more CPU during floods of output.
 
-For `spooky-integration`, also build Ghostty itself from the repo root. This
-needs `blueprint-compiler` installed. The flags keep it from using every core
-and all the memory:
-
-```sh
-nice -n 19 zig build -Doptimize=ReleaseFast -j4 --maxrss 8000000000
-```
+`spooky-integration` needs a Ghostty built from the adishourya/ghostty fork,
+where spooky came from.
 
 ## Use
 
@@ -54,7 +51,7 @@ it runs in into a session, and new tabs and splits opened from a spooky pane
 run spooky too, joining that session. Tabs and splits opened from a plain
 shell stay plain.
 
-`spooky-integration` needs a Ghostty built from this repo. Without it, set
+`spooky-integration` needs a Ghostty built from the adishourya/ghostty fork. Without it, set
 `command = /path/to/spooky` so every tab and split is a spooky pane; sessions
 are then grouped by the "active" session (the one you last typed in), and
 window layouts can't be restored.
