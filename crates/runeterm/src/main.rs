@@ -5,6 +5,7 @@ mod config;
 mod exports;
 mod grid;
 mod icons;
+mod keys;
 mod pane;
 mod split;
 mod shader;

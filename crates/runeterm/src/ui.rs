@@ -5,6 +5,7 @@
 
 use crate::config::Config;
 use crate::icons;
+use crate::keys::Action;
 use crate::split::{Dir, Node};
 use crate::state::{PickerMode, State, Tab, WAKER};
 use rune::color::hex;
@@ -99,7 +100,7 @@ fn dot(c: Color, pulse: bool) -> El {
 
 /// While a split is full screen, its zoom button is a glowing circle in the accent; clicking
 /// it (or ⌥Z) brings the other splits back.
-fn zoomed_button(id: u32) -> El {
+fn zoomed_button(s: &State, id: u32) -> El {
     let c = look::accent();
     el().key(format!("zoom-{id}")).size(26.0, 26.0).radius(13.0).center()
         .fill(c.alpha(0.9))
@@ -108,18 +109,36 @@ fn zoomed_button(id: u32) -> El {
         .hover(look::ink(0.12)).press(look::ink(0.2)).cursor(Cursor::Pointer)
         .transition(Transition::scale(0.6).combined(Transition::opacity()))
         .cycle(BREATHE)
-        .help("Exit full screen  ⌥Z".to_string())
+        .help(s.keybinds.hint("Exit full screen", Action::Zoom))
         .on_press(move |s: &mut State| s.toggle_zoom(id))
         .child(icon(&icons::COLLAPSE, 13.0).color(hex("#0b0b0d").unwrap()))
 }
 
-fn tool(key: String, i: &'static Icon, help: &str, f: impl Fn(&mut State) + 'static) -> El {
+fn tool(key: String, i: &'static Icon, help: String, f: impl Fn(&mut State) + 'static) -> El {
     el().key(key).size(26.0, 26.0).radius(7.0).center()
         .hover(look::ink(0.08)).press(look::ink(0.14))
         .cursor(Cursor::Pointer)
-        .help(help.to_string())
+        .help(help)
         .on_press(f)
         .child(icon(i, 15.0).color(look::dim()))
+}
+
+/// A floating split's pin: lit in the accent while it's pinned across tabs.
+fn pin_tool(s: &State, id: u32) -> El {
+    let pinned = s.is_pinned(id);
+    let c = look::accent();
+    let help = s.keybinds.hint(if pinned { "Unpin (stay in this tab)" } else { "Pin across tabs" }, Action::PinFloat);
+    let b = tool(format!("pin-{id}"), &icons::PIN, help, move |s: &mut State| s.toggle_pin(id));
+    if pinned {
+        el().key(format!("pin-{id}")).size(26.0, 26.0).radius(7.0).center()
+            .fill(c.alpha(0.18)).border(1.0, c.alpha(0.45))
+            .hover(c.alpha(0.28)).cursor(Cursor::Pointer)
+            .help(s.keybinds.hint("Unpin (stay in this tab)", Action::PinFloat))
+            .on_press(move |s: &mut State| s.toggle_pin(id))
+            .child(icon(&icons::PIN, 15.0).color(c))
+    } else {
+        b
+    }
 }
 
 /// One split: the Rune surface with its header, and the terminal's effect slot under it.
@@ -138,31 +157,35 @@ fn pane(s: &State, tab: &Tab, id: u32) -> El {
         title = title.child(dot(look::attention(), true));
     }
     // Unfocused splits keep their buttons hidden until hovered.
+    let k = &s.keybinds;
     let mut tools = row().gap(1.0).ml(8.0);
     if floating {
-        tools = tools.child(tool(format!("dock-{id}"), &icons::DOCK, "Dock  ⌥F", move |s: &mut State| s.toggle_float(id)));
+        tools = tools
+            .child(pin_tool(s, id))
+            .child(tool(format!("min-{id}"), &icons::MINIMIZE, k.hint("Minimize", Action::Minimize), move |s: &mut State| s.minimize(id)))
+            .child(tool(format!("dock-{id}"), &icons::DOCK, k.hint("Dock", Action::Float), move |s: &mut State| s.toggle_float(id)));
     } else {
         tools = tools
-            .child(tool(format!("split-r-{id}"), &icons::SPLIT_RIGHT, "Split right  ⌥[", move |s: &mut State| {
+            .child(tool(format!("split-r-{id}"), &icons::SPLIT_RIGHT, k.hint("Split right", Action::SplitRight), move |s: &mut State| {
                 s.focus(id);
                 s.split(Dir::Right)
             }))
-            .child(tool(format!("split-d-{id}"), &icons::SPLIT_DOWN, "Split down  ⌥-", move |s: &mut State| {
+            .child(tool(format!("split-d-{id}"), &icons::SPLIT_DOWN, k.hint("Split down", Action::SplitDown), move |s: &mut State| {
                 s.focus(id);
                 s.split(Dir::Down)
             }));
     }
     if !only && !floating {
         tools = tools
-            .child(tool(format!("float-{id}"), &icons::FLOAT, "Float  ⌥F", move |s: &mut State| s.toggle_float(id)))
-            .child(tool(format!("min-{id}"), &icons::MINIMIZE, "Minimize  ⌥M", move |s: &mut State| s.minimize(id)))
+            .child(tool(format!("float-{id}"), &icons::FLOAT, k.hint("Float", Action::Float), move |s: &mut State| s.toggle_float(id)))
+            .child(tool(format!("min-{id}"), &icons::MINIMIZE, k.hint("Minimize", Action::Minimize), move |s: &mut State| s.minimize(id)))
             .child(if tab.zoomed {
-                zoomed_button(id)
+                zoomed_button(s, id)
             } else {
-                tool(format!("zoom-{id}"), &icons::EXPAND, "Full screen  ⌥Z", move |s: &mut State| s.toggle_zoom(id))
+                tool(format!("zoom-{id}"), &icons::EXPAND, k.hint("Full screen", Action::Zoom), move |s: &mut State| s.toggle_zoom(id))
             });
     }
-    tools = tools.child(tool(format!("close-{id}"), &icons::CLOSE, "Close  ⌥X", move |s: &mut State| s.request_close(id)));
+    tools = tools.child(tool(format!("close-{id}"), &icons::CLOSE, k.hint("Close", Action::Close), move |s: &mut State| s.request_close(id)));
     let tools = if focused { tools } else { tools.group_opacity(0.0, 1.0) };
 
     let mut header = row().key(format!("head-{id}")).h(40.0).w_full().pl(12.0).pr(8.0).items_center()
@@ -270,11 +293,13 @@ fn float_drag(s: &mut State, id: u32, d: &mut Drag, tx: &mut Tx, resize: bool) {
     }
 }
 
-/// The floating splits of `tab`, over its layout.
-fn floats(s: &State, tab: &Tab) -> El {
+/// The floating splits of `tab` over its layout: the pinned ones (`pinned`), which stay put while
+/// tabs slide, or the tab's own.
+fn floats(s: &State, tab: &Tab, pinned: bool) -> El {
     let [w, h] = s.stage;
-    let mut layer = el().key(format!("floats-{}", tab.id)).pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0));
-    for f in &tab.floating {
+    let key = if pinned { "floats-pinned".to_string() } else { format!("floats-{}", tab.id) };
+    let mut layer = el().key(key).pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0));
+    for f in tab.floating.iter().filter(|f| f.pinned == pinned) {
         let [x, y, fw, fh] = f.rect;
         let card = el().key(format!("float-{}", f.id)).absolute(x * w, y * h).size(fw * w, fh * h)
             .radius(look::RADIUS)
@@ -373,7 +398,9 @@ fn leaf(s: &State, tab: &Tab, id: u32, active_tab: bool) -> El {
     if minimized {
         r = r.opacity(0.7).child(icon(&icons::MINIMIZE, 12.0).color(look::faint()));
     }
-    if tab.is_floating(id) {
+    if s.is_pinned(id) {
+        r = r.child(icon(&icons::PIN, 12.0).color(look::accent()));
+    } else if tab.is_floating(id) {
         r = r.child(icon(&icons::FLOAT, 12.0).color(look::faint()));
     }
     if attention {
@@ -404,7 +431,7 @@ fn tab_group(s: &State, i: usize, tab: &Tab) -> El {
         head = head.child(dot(look::attention(), true));
     }
     if i < 9 {
-        head = head.child(text(format!("⌥{}", i + 1)).font(CAPS).color(look::faint()));
+        head = head.child(text(s.keybinds.label(Action::GotoTab(i as u8 + 1))).font(CAPS).color(look::faint()));
     }
 
     // Splits hang off a thin rail, like a tree.
@@ -624,7 +651,7 @@ fn wide(s: &State) -> El {
         .child(icon(&icons::PLUS, 16.0).color(look::dim()))
         .child(text("New tab").font(BODY).color(look::dim()))
         .child(el().grow(1.0))
-        .child(text("⌥T").font(CAPS).color(look::faint()));
+        .child(text(s.keybinds.label(Action::NewTab)).font(CAPS).color(look::faint()));
     col().w(w).h_full().py(12.0).px(12.0).gap(8.0)
         .child(card)
         .child(text("TABS").font(CAPS).color(look::faint()).px(10.0).mt(8.0))
@@ -992,8 +1019,8 @@ pub fn view(s: &State, _: &mut Cx<State>) -> El {
         .transition(slide(dir));
     let layer = layer.child(main);
     let mut layer = layer;
-    if let Some(tab) = s.tab().filter(|t| !t.floating.is_empty() && !t.zoomed) {
-        layer = layer.child(floats(s, tab));
+    if let Some(tab) = s.tab().filter(|t| t.floating.iter().any(|f| !f.pinned) && !t.zoomed) {
+        layer = layer.child(floats(s, tab, false));
     }
     let mut stage = el().key("stage").grow(1.0).h_full().min_w(0.0)
         .clip_rounded(look::RADIUS)
@@ -1005,6 +1032,10 @@ pub fn view(s: &State, _: &mut Cx<State>) -> El {
         })
         .child_exit(slide(-dir))
         .child(layer);
+    // Pinned floating splits sit above the tabs, still while they slide.
+    if let Some(tab) = s.tab().filter(|t| t.floating.iter().any(|f| f.pinned) && !t.zoomed) {
+        stage = stage.child(floats(s, tab, true));
+    }
     if let Some(tab) = s.tab().filter(|t| !t.minimized.is_empty()) {
         let mut dock = row().key("dock").gap(10.0).justify_center();
         for m in &tab.minimized {
@@ -1019,7 +1050,66 @@ pub fn view(s: &State, _: &mut Cx<State>) -> El {
     if let Some(sessions) = &s.picker {
         root = root.child(picker(s, sessions));
     }
+    if s.palette.is_some() {
+        root = root.child(palette(s));
+    }
     root
+}
+
+/// The command palette (⌥P): every action, filtered as you type. ↑↓ choose, Enter runs, Esc
+/// closes; clicking a row runs it, clicking outside closes.
+fn palette(s: &State) -> El {
+    let Some(p) = &s.palette else { return el() };
+    let items = s.palette_items();
+    let chosen = p.chosen.min(items.len().saturating_sub(1));
+    let field = rune::text_input(&p.edit, TextStyle::new(15.0, 500.0))
+        .key("palette-field")
+        .single_line()
+        .placeholder("Type a command…", look::faint())
+        .caret(look::accent(), look::accent().alpha(0.3))
+        .color(look::text())
+        .on_edit(|s: &mut State| &mut s.palette.as_mut().expect("palette open").edit)
+        .on_input_key(|s: &mut State, e, tx: &mut Tx| s.palette_key(e, tx))
+        .w_full();
+    let search = row().h(46.0).px(14.0).gap(10.0).items_center()
+        .child(icon(&icons::SEARCH, 17.0).color(look::dim()))
+        .child(el().grow(1.0).min_w(0.0).child(field));
+    let mut list = col().key("palette-list").w_full().gap(1.0).px(6.0).pb(6.0).max_h(420.0).scroll(rune::ScrollSpec { stick_bottom: false });
+    if items.is_empty() {
+        list = list.child(text("No matching command").font(BODY).color(look::faint()).px(10.0).py(12.0));
+    }
+    for (i, (action, title, keys)) in items.into_iter().enumerate() {
+        let on = i == chosen;
+        let mut r = row().key(format!("palette-{}", action.name())).h(36.0).w_full().px(10.0).gap(10.0).items_center().radius(9.0)
+            .hover(look::ink(0.05)).cursor(Cursor::Pointer)
+            .on_press_tx(move |s: &mut State, tx: &mut Tx| s.run_chosen_at(i, tx))
+            .child(text(title).font(TextStyle::new(13.0, if on { 600.0 } else { 480.0 })).color(if on { look::text() } else { look::dim() })
+                .single_line().truncate().grow(1.0).shrink());
+        if !keys.is_empty() {
+            r = r.child(el().h(22.0).px(7.0).radius(6.0).center().fill(look::ink(0.06)).border(1.0, look::ink(0.07))
+                .child(text(keys).font(TextStyle::new(11.5, 600.0)).color(look::dim())));
+        }
+        if on {
+            r = r.fill(look::accent().alpha(0.14)).border(1.0, look::accent().alpha(0.35));
+        }
+        list = list.child(r);
+    }
+    let panel = col().key("palette").w(560.0).radius(16.0)
+        .fill(look::surface(2).alpha(0.97)).backdrop_blur(24.0)
+        .border(1.0, look::ink(0.08))
+        .shadow(4.0, 12.0, look::shade(0.45)).shadow(24.0, 64.0, look::shade(0.55))
+        .transition(Transition::offset(0.0, -8.0).combined(Transition::scale(0.98)).combined(Transition::opacity()))
+        .on_press(|_: &mut State| {})
+        .child(search)
+        .child(el().h(1.0).w_full().fill(look::ink(0.06)).mb(6.0))
+        .child(list)
+        .child(row().h(30.0).px(16.0).gap(14.0).items_center().border_sides([1.0, 0.0, 0.0, 0.0], look::ink(0.05))
+            .child(text("↑↓ choose · ↩ run · esc close").font(SMALL).color(look::faint()))
+            .child(el().grow(1.0))
+            .child(text("keybind = CHORD=ACTION in the config").font(SMALL).color(look::faint())));
+    el().key("palette-layer").pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0)).raise()
+        .child(el().pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0)).fill(look::shade(0.25)).on_press(|s: &mut State| s.palette = None))
+        .child(row().w_full().justify_center().items_start().pt(90.0).child(panel))
 }
 
 pub fn spec() -> AppSpec<State> {
@@ -1074,6 +1164,20 @@ pub fn spec() -> AppSpec<State> {
                 s.split(Dir::Right);
             }),
             ("picker", |s| s.toggle_picker()),
+            ("palette", |s| {
+                s.palette = Some(crate::state::Palette { edit: rune::TextEdit::new(""), chosen: 2 });
+            }),
+            ("palette-filtered", |s| {
+                s.palette = Some(crate::state::Palette { edit: rune::TextEdit::new("flo"), chosen: 0 });
+            }),
+            ("pinned-float", |s| {
+                // A split floating and pinned, carried along to a second tab.
+                s.split(Dir::Right);
+                let id = s.tabs[0].focused;
+                s.toggle_pin(id);
+                s.new_tab(None);
+                s.focus(id);
+            }),
             ("confirm-kill", |s| {
                 s.toggle_picker();
                 let name = s.picker.as_ref().and_then(|l| l.first()).map(|x| x.name.clone()).unwrap_or_default();
@@ -1128,5 +1232,72 @@ fn demo(s: &mut State) {
     std::thread::sleep(std::time::Duration::from_millis(1800));
     for p in s.panes.values_mut() {
         p.refresh_meta(None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rune::edit::{Key, KeyEvent};
+    use rune::{Env, Mods, Runtime};
+
+    fn press(rt: &mut Runtime<State>, key: Key, mods: Mods) {
+        rt.key(KeyEvent { key, mods });
+        rt.frame(0.0);
+    }
+
+    fn alt() -> Mods {
+        Mods { alt: true, ..Mods::default() }
+    }
+
+    /// The palette end to end through Rune's key routing: ⌥P opens it with its field focused,
+    /// typing filters, ↓ chooses, Enter runs the choice and closes it.
+    #[test]
+    fn the_palette_opens_filters_and_runs() {
+        let mut s = State::new(&Config::default(), false, None);
+        s.split(Dir::Right);
+        let mut rt = Runtime::new(s, view, (1280.0, 780.0), Env::new(true, 1.0));
+        rt.on_key = Some(|s, e, tx| s.key(e, tx));
+        rt.frame(0.0);
+        press(&mut rt, Key::Text("p".into()), alt());
+        assert!(rt.state.palette.is_some(), "⌥P opens it");
+        for c in "min".chars() {
+            press(&mut rt, Key::Text(c.to_string()), Mods::default());
+        }
+        assert_eq!(rt.state.palette.as_ref().unwrap().edit.text, "min", "the field takes the typing");
+        let rows = rt.state.palette_items();
+        assert_eq!(rows[0].0, Action::Minimize);
+        press(&mut rt, Key::Down, Mods::default());
+        assert_eq!(rt.state.palette.as_ref().unwrap().chosen, 1);
+        press(&mut rt, Key::Up, Mods::default());
+        press(&mut rt, Key::Enter, Mods::default());
+        assert!(rt.state.palette.is_none(), "Enter closes it");
+        assert_eq!(rt.state.tabs[0].minimized.len(), 1, "and minimized the focused split");
+        // Escape and ⌥P both close it again.
+        press(&mut rt, Key::Text("p".into()), alt());
+        press(&mut rt, Key::Escape, Mods::default());
+        assert!(rt.state.palette.is_none());
+        press(&mut rt, Key::Text("p".into()), alt());
+        press(&mut rt, Key::Text("p".into()), alt());
+        assert!(rt.state.palette.is_none());
+    }
+
+    /// The default keys still reach their actions, and unbound ones reach the terminal.
+    #[test]
+    fn keybinds_drive_floating_and_pinning() {
+        let mut s = State::new(&Config::default(), false, None);
+        s.split(Dir::Right);
+        let id = s.tabs[0].focused;
+        let mut rt = Runtime::new(s, view, (1280.0, 780.0), Env::new(true, 1.0));
+        rt.on_key = Some(|s, e, tx| s.key(e, tx));
+        rt.frame(0.0);
+        press(&mut rt, Key::Text("f".into()), alt());
+        assert!(rt.state.tabs[0].is_floating(id), "⌥F floats");
+        press(&mut rt, Key::Text("F".into()), Mods { alt: true, shift: true, ..Mods::default() });
+        assert!(rt.state.is_pinned(id), "⌥⇧F pins");
+        press(&mut rt, Key::Text("m".into()), alt());
+        assert!(rt.state.tabs[0].floating.is_empty() && rt.state.tabs[0].minimized.len() == 1, "⌥M minimizes a float");
+        press(&mut rt, Key::Text("M".into()), Mods { alt: true, shift: true, ..Mods::default() });
+        assert!(rt.state.is_pinned(id), "⌥⇧M brings it back, pinned");
     }
 }

@@ -37,6 +37,8 @@ pub struct Config {
     pub copy_on_select: bool,
     pub confirm_close: bool,
     pub notifications: bool,
+    /// `keybind = CHORD=ACTION`: the keys, the defaults changed by the config's lines.
+    pub keybinds: crate::keys::Keybinds,
 }
 
 /// The sidebar's settings.
@@ -112,6 +114,7 @@ impl Default for Config {
             copy_on_select: false,
             confirm_close: true,
             notifications: true,
+            keybinds: crate::keys::Keybinds::default(),
             accents: ["#8ab4f8", "#a78bfa", "#ff7ab6", "#ff9f5a", "#ffd166", "#7ee081", "#4fd1c5"].map(|h| rgb(h).unwrap()).to_vec(),
         }
     }
@@ -271,7 +274,9 @@ impl Config {
              notifications = {notifications}\n\
              # alt+e opens the focused split's scrollback in this editor. auto: $VISUAL,\n\
              # $EDITOR, or the first of nvim, vim, hx, vi that's installed.\n\
-             scrollback-editor = {editor}\n",
+             scrollback-editor = {editor}\n\
+             \n\
+             {keybinds}",
             f.family,
             f.size,
             f.padding,
@@ -286,6 +291,7 @@ impl Config {
             self.sidebar.battery,
             self.sidebar.host,
             editor = self.scrollback_editor,
+            keybinds = keybind_section(),
             copy_on_select = self.copy_on_select,
             confirm_close = self.confirm_close,
             notifications = self.notifications,
@@ -367,6 +373,11 @@ impl Config {
                 "confirm-close" | "confirm-close-surface" => self.confirm_close = v != "false",
                 "notifications" | "desktop-notifications" => self.notifications = v != "false",
                 "accent" => self.accent = rgb(v).unwrap_or(self.accent),
+                "keybind" => {
+                    if let Err(e) = self.keybinds.apply(v) {
+                        eprintln!("runeterm: keybind = {v}: {e}");
+                    }
+                }
                 "accent-colors" => {
                     let list: Vec<Rgb> = v.split(',').filter_map(rgb).collect();
                     if !list.is_empty() {
@@ -429,6 +440,18 @@ pub fn set(key: &str, value: &str) -> std::io::Result<()> {
         out.push(format!("{key} = {value}"));
     }
     std::fs::write(&path, out.join("\n") + "\n")
+}
+
+/// The keybind section of a new config: how to change keys, and every default.
+fn keybind_section() -> String {
+    format!(
+        "# --- Keybinds ---\n\
+         # keybind = CHORD=ACTION binds a key, CHORD=unbind frees it for the terminal, and\n\
+         # keybind = clear drops every default. Modifiers: ctrl, alt, shift, super. ⌥P lists\n\
+         # every action. These are the defaults:\n\
+         {}",
+        crate::keys::Keybinds::default_lines()
+    )
 }
 
 pub fn hex_of(c: Rgb) -> String {

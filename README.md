@@ -64,9 +64,15 @@ spooky too.
   appearance section shows what it chose. 0 (the default) keeps them exact. Dividers snap to
   whole lines and columns once you let go of them (or the window settles), so a split never
   ends in a part of a line; with `font-size-fit` the last split in a column comes out whole too.
-- Keys: ⌥[ / ⌥- split, ⌥h/j/k/l focus, ⌥⇧h/j/k/l swap, ⌥w/a/s/d resize, ⌥Z (or ⌥↩) full screen, ⌥M minimize,
-  ⌥F float or dock (drag a floating split by its header, resize it from its corner), ⌥X close, ⌥T new tab, ⌥1–9 tabs, ⌥/ pin or unpin the sidebar, ⌥E open the scrollback in
-  an editor (`scrollback-editor`).
+- Keys: ⌥P opens the command palette, which lists every action with its key (type to filter,
+  ↑↓ and Enter to run). ⌥[ / ⌥- split, ⌥h/j/k/l focus, ⌥⇧h/j/k/l swap, ⌥w/a/s/d resize,
+  ⌥Z (or ⌥↩) full screen, ⌥M minimize (⌥⇧M brings the last one back), ⌥F float or dock (drag a
+  floating split by its header, resize it from its corner), ⌥⇧F pin a floating split so it stays
+  in view on every tab, ⌥X close, ⌥T new tab, ⌥1–9 tabs, ⌥/ pin or unpin the sidebar, ⌥E open
+  the scrollback in an editor (`scrollback-editor`).
+- Rebind them in the config, Ghostty-style: `keybind = alt+n=minimize`, `keybind = alt+m=unbind`
+  to give a key back to the terminal, `keybind = clear` to drop every default. A new config
+  lists every default under `Keybinds`, with each action's name.
 - Mouse: drag to select (twice for a word, three times for a line), Ctrl+Shift+C / Ctrl+Shift+V
   copy and paste, middle-click pastes the selection, Ctrl+click opens links, drag the gap between
   splits to resize them. Programs that use the mouse get it; hold Shift to select instead.

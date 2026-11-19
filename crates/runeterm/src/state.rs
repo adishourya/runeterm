@@ -2,6 +2,7 @@
 //! keys to the focused pane.
 
 use crate::config::Config;
+use crate::keys::{Action, Keybinds};
 use crate::pane::{Pane, Source, Theme};
 use crate::spooky::{self, Controller, Event, SessionInfo};
 use crate::split::{Dir, Node, Place, Side};
@@ -24,6 +25,8 @@ pub struct Minimized {
     pub offset: (f32, f32),
     /// The offset when the current drag started.
     pub drag_from: Option<(f32, f32)>,
+    /// It floated before (where, and whether pinned): it comes back floating.
+    pub floated: Option<([f32; 4], bool)>,
 }
 
 /// A split floating above the others in its tab: dragged by its header, resized from its
@@ -35,6 +38,8 @@ pub struct Floating {
     pub rect: [f32; 4],
     /// The rect when the current drag started.
     pub drag_from: Option<[f32; 4]>,
+    /// Pinned: it stays in view on every tab (it moves to whichever tab is shown).
+    pub pinned: bool,
 }
 
 impl Floating {
@@ -76,6 +81,12 @@ impl Tab {
     pub fn is_floating(&self, id: u32) -> bool {
         self.floating.iter().any(|f| f.id == id)
     }
+}
+
+/// The command palette (⌥P): what's typed, and the row chosen with the arrows.
+pub struct Palette {
+    pub edit: rune::TextEdit,
+    pub chosen: usize,
 }
 
 /// What the session picker shows.
@@ -203,6 +214,10 @@ pub struct State {
     next_id: u32,
     keys: KeyEncoder,
     last_meta: f64,
+    /// What runeterm's own keys do (the config's `keybind` lines).
+    pub keybinds: Keybinds,
+    /// The command palette, while it's open.
+    pub palette: Option<Palette>,
 }
 
 impl State {
@@ -287,6 +302,8 @@ impl State {
             next_id: 1,
             keys: KeyEncoder::default(),
             last_meta: -1.0,
+            keybinds: config.keybinds.clone(),
+            palette: None,
         };
         match attach {
             Some(name) if s.controller.is_some() => s.open_session(&name),
@@ -333,9 +350,41 @@ impl State {
     /// Switches tabs. The new one slides in from below when it's further down the list, from
     /// above when it's further up.
     pub fn select_tab(&mut self, i: usize) {
-        if i != self.active {
+        if i != self.active && i < self.tabs.len() {
             self.slide = if i > self.active { 1.0 } else { -1.0 };
+            self.carry_pinned(self.active, i);
             self.active = i;
+        }
+    }
+
+    /// Moves the pinned floating splits from tab `from` to tab `to`, so they stay in view. One
+    /// that had focus keeps it.
+    fn carry_pinned(&mut self, from: usize, to: usize) {
+        let Some(tab) = self.tabs.get_mut(from) else { return };
+        if !tab.floating.iter().any(|f| f.pinned) {
+            return;
+        }
+        let (pinned, rest): (Vec<Floating>, Vec<Floating>) = std::mem::take(&mut tab.floating).into_iter().partition(|f| f.pinned);
+        tab.floating = rest;
+        let had_focus = pinned.iter().any(|f| f.id == tab.focused).then_some(tab.focused);
+        if had_focus.is_some() {
+            tab.focused = tab.root.first();
+            tab.zoomed = false;
+        }
+        let Some(dest) = self.tabs.get_mut(to) else { return };
+        dest.floating.extend(pinned);
+        if let Some(id) = had_focus {
+            dest.focused = id;
+            dest.zoomed = false;
+        }
+    }
+
+    /// Switches to the tab `by` away from this one, wrapping around.
+    pub fn cycle_tab(&mut self, by: isize) {
+        let n = self.tabs.len() as isize;
+        if n > 1 {
+            let i = (self.active as isize + by).rem_euclid(n) as usize;
+            self.select_tab(i);
         }
     }
 
@@ -488,11 +537,22 @@ impl State {
 
     /// Takes a split out of the layout; it keeps running and waits as a pill.
     pub fn minimize(&mut self, id: u32) {
+        // A floating split waits as a pill too, and comes back floating where it was.
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.is_floating(id)) {
+            let i = tab.floating.iter().position(|f| f.id == id).unwrap();
+            let f = tab.floating.remove(i);
+            tab.minimized.push(Minimized { id, place: f.place, offset: (0.0, 0.0), drag_from: None, floated: Some((f.rect, f.pinned)) });
+            if tab.focused == id {
+                tab.focused = tab.root.first();
+            }
+            tab.zoomed = false;
+            return;
+        }
         let Some(tab) = self.tabs.iter_mut().find(|t| t.root.contains(id)) else { return };
         let place = tab.root.place_of(id);
         let Some(rest) = tab.root.remove(id) else { return }; // never the last one in view
         tab.root = rest;
-        tab.minimized.push(Minimized { id, place, offset: (0.0, 0.0), drag_from: None });
+        tab.minimized.push(Minimized { id, place, offset: (0.0, 0.0), drag_from: None, floated: None });
         if tab.focused == id {
             tab.focused = place.map_or(tab.root.first(), |p| p.beside);
         }
@@ -519,17 +579,47 @@ impl State {
             tab.root = rest;
             // Each new one a little lower and to the right of the last.
             let k = (tab.floating.len() % 5) as f32 * 0.04;
-            tab.floating.push(Floating { id, place, rect: [0.18 + k, 0.14 + k, 0.6, 0.62], drag_from: None });
+            tab.floating.push(Floating { id, place, rect: [0.18 + k, 0.14 + k, 0.6, 0.62], drag_from: None, pinned: false });
         }
         tab.focused = id;
         tab.zoomed = false;
     }
 
-    /// Puts a minimized split back where it was (or beside the focused one).
+    /// Pins a floating split so it stays in view on every tab, or unpins it (it stays in the
+    /// tab shown). A split in the layout floats first.
+    pub fn toggle_pin(&mut self, id: u32) {
+        let floating = self.tabs.iter().any(|t| t.is_floating(id));
+        if !floating {
+            self.toggle_float(id);
+        }
+        let Some(f) = self.tabs.iter_mut().flat_map(|t| t.floating.iter_mut()).find(|f| f.id == id) else { return };
+        // Floated just now: pinning is why.
+        f.pinned = !floating || !f.pinned;
+    }
+
+    pub fn is_pinned(&self, id: u32) -> bool {
+        self.tabs.iter().flat_map(|t| &t.floating).any(|f| f.id == id && f.pinned)
+    }
+
+    /// Brings back the active tab's most recently minimized split.
+    pub fn restore_last(&mut self) {
+        if let Some(id) = self.tab().and_then(|t| t.minimized.last()).map(|m| m.id) {
+            self.restore(id);
+        }
+    }
+
+    /// Puts a minimized split back where it was (or beside the focused one), floating again if
+    /// it floated.
     pub fn restore(&mut self, id: u32) {
         let Some(tab) = self.tabs.iter_mut().find(|t| t.minimized.iter().any(|m| m.id == id)) else { return };
         let i = tab.minimized.iter().position(|m| m.id == id).unwrap();
         let m = tab.minimized.remove(i);
+        if let Some((rect, pinned)) = m.floated {
+            tab.floating.push(Floating { id, place: m.place, rect, drag_from: None, pinned });
+            tab.focused = id;
+            tab.zoomed = false;
+            return;
+        }
         let placed = m.place.is_some_and(|p| tab.root.insert(p.beside, id, p.dir, p.share, p.first));
         if !placed {
             let at = tab.focused;
@@ -921,6 +1011,7 @@ impl State {
         self.sidebar = c.sidebar;
         self.settings = Behaviour::from(&c);
         self.scrollback_editor = c.scrollback_editor.clone();
+        self.keybinds = c.keybinds.clone();
         self.theme = c.colors();
         self.light = c.light;
         self.default_accent = c.accent;
@@ -1036,6 +1127,138 @@ impl State {
         self.picker_mode = PickerMode::List;
     }
 
+    /// Does `action`, from its key or the command palette.
+    pub fn run(&mut self, action: Action, tx: &mut Tx) {
+        let focused = self.tab().map(|t| t.focused);
+        match action {
+            Action::CommandPalette => self.toggle_palette(tx),
+            Action::SplitRight => self.split(Dir::Right),
+            Action::SplitDown => self.split(Dir::Down),
+            Action::FocusLeft => self.focus_dir(Side::Left),
+            Action::FocusDown => self.focus_dir(Side::Down),
+            Action::FocusUp => self.focus_dir(Side::Up),
+            Action::FocusRight => self.focus_dir(Side::Right),
+            Action::SwapLeft => self.swap_dir(Side::Left),
+            Action::SwapDown => self.swap_dir(Side::Down),
+            Action::SwapUp => self.swap_dir(Side::Up),
+            Action::SwapRight => self.swap_dir(Side::Right),
+            Action::ResizeUp | Action::ResizeLeft | Action::ResizeDown | Action::ResizeRight => {
+                let side = match action {
+                    Action::ResizeUp => Side::Up,
+                    Action::ResizeLeft => Side::Left,
+                    Action::ResizeDown => Side::Down,
+                    _ => Side::Right,
+                };
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    tab.root.resize(tab.focused, side, 0.04);
+                }
+            }
+            Action::Zoom => focused.into_iter().for_each(|id| self.toggle_zoom(id)),
+            Action::Close => focused.into_iter().for_each(|id| self.request_close(id)),
+            Action::Minimize => focused.into_iter().for_each(|id| self.minimize(id)),
+            Action::RestoreMinimized => self.restore_last(),
+            Action::Float => focused.into_iter().for_each(|id| self.toggle_float(id)),
+            Action::PinFloat => focused.into_iter().for_each(|id| self.toggle_pin(id)),
+            Action::NewTab => self.new_tab_here(),
+            Action::NextTab => self.cycle_tab(1),
+            Action::PrevTab => self.cycle_tab(-1),
+            Action::GotoTab(n) => self.select_tab(n as usize - 1),
+            Action::Sessions => self.toggle_picker(),
+            Action::NewSession => self.new_session(),
+            Action::RenameSession => {
+                if let Some(name) = self.session.as_ref().map(|s| s.name.clone()) {
+                    self.start_rename(&name, tx);
+                }
+            }
+            Action::ToggleSidebar => self.toggle_sidebar(),
+            Action::ToggleTheme => self.set_light(!self.light),
+            Action::EditScrollback => self.edit_scrollback(),
+            Action::ReloadConfig => self.reload_config(),
+            Action::Copy => {
+                if let Some(text) = self.focused_pane().and_then(|p| p.term.lock().unwrap().selection_text()) {
+                    tx.copy(text);
+                }
+            }
+            Action::Paste => tx.read_clipboard(|s: &mut State, content, _| s.paste(content.text())),
+        }
+    }
+
+    /// Opens the command palette with its field focused, or closes it.
+    pub fn toggle_palette(&mut self, tx: &mut Tx) {
+        if self.palette.take().is_none() {
+            self.palette = Some(Palette { edit: rune::TextEdit::new(""), chosen: 0 });
+            tx.focus("palette-field", false);
+        }
+    }
+
+    /// The palette's rows for what's typed, best first: (action, title, keys). Tabs are listed
+    /// only while they exist, with their directory.
+    pub fn palette_items(&self) -> Vec<(Action, String, String)> {
+        let query = self.palette.as_ref().map_or(String::new(), |p| p.edit.text.clone());
+        let mut rows: Vec<(i32, usize, Action, String)> = Action::all()
+            .enumerate()
+            .filter(|(_, a)| *a != Action::CommandPalette)
+            .filter_map(|(i, a)| {
+                let title = match a {
+                    Action::GotoTab(n) => {
+                        let tab = self.tabs.get(n as usize - 1)?;
+                        let cwd = self.panes.get(&tab.focused).map(|p| p.cwd.clone()).unwrap_or_default();
+                        format!("{} · {cwd}", a.title())
+                    }
+                    Action::Float if self.tab().is_some_and(|t| t.is_floating(t.focused)) => "Dock floating split".into(),
+                    Action::PinFloat if self.focused_id().is_some_and(|id| self.is_pinned(id)) => "Unpin floating split".into(),
+                    _ => a.title().to_string(),
+                };
+                let score = crate::keys::fuzzy(&query, &title).or_else(|| crate::keys::fuzzy(&query, a.name()).map(|s| s - 50))?;
+                Some((score, i, a, title))
+            })
+            .collect();
+        rows.sort_by(|x, y| y.0.cmp(&x.0).then(x.1.cmp(&y.1)));
+        rows.into_iter().map(|(_, _, a, title)| (a, title, self.keybinds.label(a))).collect()
+    }
+
+    /// A key for the palette: arrows choose, Enter runs, Escape (or its own key) closes. Others
+    /// are left to its field, and the choice goes back to the best match.
+    pub fn palette_key(&mut self, e: &KeyEvent, tx: &mut Tx) -> bool {
+        if e.key == Key::Escape || self.keybinds.is(Action::CommandPalette, e, tx) {
+            self.palette = None;
+            return true;
+        }
+        let items = self.palette_items();
+        let n = items.len().max(1);
+        let Some(p) = self.palette.as_mut() else { return false };
+        match e.key {
+            Key::Up => p.chosen = (p.chosen.min(n - 1) + n - 1) % n,
+            Key::Down | Key::Tab => p.chosen = (p.chosen + 1) % n,
+            Key::Enter => {
+                self.run_chosen(tx);
+                return true;
+            }
+            _ => {
+                p.chosen = 0;
+                return false;
+            }
+        }
+        if let Some((a, ..)) = items.get(p.chosen) {
+            tx.scroll_into_view_in("palette-list", format!("palette-{}", a.name()));
+        }
+        true
+    }
+
+    /// Runs the palette's chosen row (or row `at`), closing it first.
+    pub fn run_chosen_at(&mut self, at: usize, tx: &mut Tx) {
+        let action = self.palette_items().get(at).map(|r| r.0);
+        self.palette = None;
+        if let Some(a) = action {
+            self.run(a, tx);
+        }
+    }
+
+    fn run_chosen(&mut self, tx: &mut Tx) {
+        let at = self.palette.as_ref().map_or(0, |p| p.chosen);
+        self.run_chosen_at(at, tx);
+    }
+
     /// Ends every pane of `session` and forgets it. If it's this window's, the window starts a
     /// new session instead of closing.
     pub fn kill_session(&mut self, session: &str) {
@@ -1055,7 +1278,8 @@ impl State {
     }
 
 
-    /// Keybinds first (Ghostty's, from the user's config), then everything to the focused pane.
+    /// The session chooser, a rename or a close waiting for an answer first, then runeterm's
+    /// keybinds, then everything else to the focused pane.
     pub fn key(&mut self, e: &KeyEvent, tx: &mut Tx) -> bool {
         let m = e.mods;
         // A new window asking which session to be: arrows choose, Enter takes it, Escape starts
@@ -1093,79 +1317,15 @@ impl State {
                 _ => {}
             }
         }
-        // Ctrl+Shift+C copies the selection, Ctrl+Shift+V pastes.
-        if m.ctrl && m.shift && !m.alt {
-            let c = match &e.key {
-                Key::Command(c) => Some(c.to_ascii_lowercase()),
-                Key::Text(t) => t.chars().next().map(|c| c.to_ascii_lowercase()),
-                _ => None,
-            };
-            match c {
-                Some('c') => {
-                    if let Some(text) = self.focused_pane().and_then(|p| p.term.lock().unwrap().selection_text()) {
-                        tx.copy(text);
-                    }
-                    return true;
-                }
-                Some('v') => {
-                    tx.read_clipboard(|s: &mut State, content, _| s.paste(content.text()));
-                    return true;
-                }
-                _ => {}
-            }
+        // The palette's field has focus and takes its own keys; these are the ones it passed
+        // on, or all of them once it lost focus.
+        if self.palette.is_some() {
+            return self.palette_key(e, tx);
         }
-        if m.alt && !m.ctrl {
-            let ch = match &e.key {
-                Key::Text(s) => s.chars().next(),
-                Key::Command(c) => Some(*c),
-                Key::Enter => Some('\n'),
-                _ => None,
-            };
-            let side = |c: char| match c.to_ascii_lowercase() {
-                'h' => Some(Side::Left),
-                'j' => Some(Side::Down),
-                'k' => Some(Side::Up),
-                'l' => Some(Side::Right),
-                _ => None,
-            };
-            let handled = match ch {
-                Some(c) if m.shift && side(c).is_some() => {
-                    self.swap_dir(side(c).unwrap());
-                    true
-                }
-                Some(_) if m.shift => false,
-                Some('-') => { self.split(Dir::Down); true }
-                Some('[') => { self.split(Dir::Right); true }
-                Some(c) if side(c).is_some() => {
-                    self.focus_dir(side(c).unwrap());
-                    true
-                }
-                Some(c @ ('w' | 'a' | 's' | 'd')) => {
-                    let side = match c { 'w' => Side::Up, 'a' => Side::Left, 's' => Side::Down, _ => Side::Right };
-                    let tab = &mut self.tabs[self.active];
-                    tab.root.resize(tab.focused, side, 0.04);
-                    true
-                }
-                Some('\n' | 'z') => { let id = self.tabs[self.active].focused; self.toggle_zoom(id); true }
-                Some('x') => { let id = self.tabs[self.active].focused; self.request_close(id); true }
-                Some('m') => { let id = self.tabs[self.active].focused; self.minimize(id); true }
-                Some('f') => { let id = self.tabs[self.active].focused; self.toggle_float(id); true }
-                Some('r') => { self.reload_config(); true }
-                Some('e') => { self.edit_scrollback(); true }
-                Some('/') => { self.toggle_sidebar(); true }
-                Some('t') => { self.new_tab_here(); true }
-                Some(c @ '1'..='9') => {
-                    let i = c as usize - '1' as usize;
-                    if i < self.tabs.len() {
-                        self.select_tab(i);
-                    }
-                    true
-                }
-                _ => false,
-            };
-            if handled {
-                return true;
-            }
+        // runeterm's own keys (`keybind` in the config), before the terminal sees them.
+        if let Some(action) = self.keybinds.action(e, tx) {
+            self.run(action, tx);
+            return true;
         }
         let Some(pane) = self.focused_pane() else { return false };
         let term = pane.term.clone();
@@ -1620,13 +1780,75 @@ mod tests {
 
     #[test]
     fn a_floating_split_stays_inside_the_tab() {
-        let mut f = Floating { id: 1, place: None, rect: [0.2, 0.2, 0.5, 0.5], drag_from: None };
+        let mut f = Floating { id: 1, place: None, rect: [0.2, 0.2, 0.5, 0.5], drag_from: None, pinned: false };
         f.drag_from = Some(f.rect);
         f.drag(-1.0, 2.0, false);
         assert_eq!(f.rect, [0.0, 0.5, 0.5, 0.5]);
         f.drag_from = Some(f.rect);
         f.drag(1.0, -1.0, true);
         assert_eq!(f.rect, [0.0, 0.5, 1.0, 0.2]);
+    }
+
+    #[test]
+    fn a_pinned_float_follows_the_tab_shown() {
+        let mut s = state_with(2);
+        let ids = s.tabs[0].root.leaves();
+        let (pinned, plain) = (ids[1], ids[0]);
+        s.toggle_pin(pinned); // floats it and pins it
+        assert!(s.is_pinned(pinned) && s.tabs[0].is_floating(pinned));
+        s.new_tab(None);
+        assert_eq!(s.active, 1);
+        assert!(s.tabs[1].is_floating(pinned), "carried to the new tab");
+        assert!(!s.tabs[0].has(pinned));
+        assert_eq!(s.tabs[1].focused, pinned, "it had focus, and keeps it");
+        assert_eq!(s.tabs[0].focused, plain);
+        s.select_tab(0);
+        assert!(s.tabs[0].is_floating(pinned) && !s.tabs[1].has(pinned));
+        // Unpinned, it stays behind.
+        s.toggle_pin(pinned);
+        assert!(!s.is_pinned(pinned));
+        s.select_tab(1);
+        assert!(s.tabs[0].is_floating(pinned) && !s.tabs[1].has(pinned));
+    }
+
+    #[test]
+    fn pinning_a_lone_split_does_nothing() {
+        let mut s = state_with(1);
+        let id = s.tabs[0].focused;
+        s.toggle_pin(id);
+        assert!(!s.is_pinned(id) && s.tabs[0].floating.is_empty());
+    }
+
+    #[test]
+    fn a_minimized_float_comes_back_floating() {
+        let mut s = state_with(2);
+        let id = s.tabs[0].root.leaves()[1];
+        s.toggle_pin(id);
+        let rect = s.tabs[0].floating[0].rect;
+        s.minimize(id);
+        assert!(s.tabs[0].floating.is_empty() && s.tabs[0].minimized.len() == 1);
+        assert_ne!(s.tabs[0].focused, id);
+        s.restore_last();
+        assert!(s.tabs[0].minimized.is_empty());
+        assert_eq!(s.tabs[0].floating[0].rect, rect);
+        assert!(s.is_pinned(id), "still pinned");
+        assert_eq!(s.tabs[0].focused, id);
+    }
+
+    #[test]
+    fn the_palette_filters_and_skips_missing_tabs() {
+        let mut s = state_with(1);
+        s.palette = Some(Palette { edit: rune::TextEdit::new(""), chosen: 0 });
+        let all = s.palette_items();
+        assert!(all.iter().any(|r| r.0 == Action::GotoTab(1)));
+        assert!(!all.iter().any(|r| r.0 == Action::GotoTab(2)), "only tabs that exist");
+        assert!(!all.iter().any(|r| r.0 == Action::CommandPalette));
+        s.palette.as_mut().unwrap().edit = rune::TextEdit::new("minim");
+        let rows = s.palette_items();
+        assert_eq!(rows[0].0, Action::Minimize);
+        assert_eq!(rows[0].2, "⌥M");
+        s.palette.as_mut().unwrap().edit = rune::TextEdit::new("pin");
+        assert_eq!(s.palette_items()[0].0, Action::PinFloat);
     }
 
     #[test]

@@ -20,6 +20,8 @@ icon!(EXPAND, "rt-expand", r#"<path d="M14 4h6v6M10 20H4v-6M20 4l-6.5 6.5M4 20l6
 icon!(COLLAPSE, "rt-collapse", r#"<path d="M4 14h6v6M20 10h-6V4M10 14l-6.5 6.5M14 10l6.5-6.5"/>"#);
 icon!(FLOAT, "rt-float", r#"<rect x="3.5" y="8.5" width="12" height="12" rx="2.5"/><path d="M11 4h7.5A1.5 1.5 0 0 1 20 5.5V13"/>"#);
 icon!(DOCK, "rt-dock", r#"<rect x="3.5" y="4.5" width="17" height="15" rx="2.5"/><path d="M12 4.5v15"/>"#);
+icon!(PIN, "rt-pin", r#"<path d="M9 3.5h6M10 3.5v5.5l-3.5 4h11L14 9V3.5M12 13v7.5"/>"#);
+icon!(SEARCH, "rt-search", r#"<circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/>"#);
 icon!(MINIMIZE, "rt-minimize", r#"<path d="M6 17.5h12"/>"#);
 icon!(RESTORE, "rt-restore", r#"<path d="M7 14l5-5 5 5"/>"#);
 icon!(CHEVRON, "rt-chevron", r#"<path d="M7 10l5 5 5-5"/>"#);
