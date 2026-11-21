@@ -1163,6 +1163,12 @@ pub fn spec() -> AppSpec<State> {
                 s.sidebar.pinned = true;
                 s.split(Dir::Right);
             }),
+            ("readme", |s| showcase(s, false)),
+            ("readme-float", |s| showcase(s, true)),
+            ("readme-palette", |s| {
+                showcase(s, false);
+                s.palette = Some(crate::state::Palette { edit: rune::TextEdit::new("split"), chosen: 0 });
+            }),
             ("picker", |s| s.toggle_picker()),
             ("palette", |s| {
                 s.palette = Some(crate::state::Palette { edit: rune::TextEdit::new(""), chosen: 2 });
@@ -1203,6 +1209,51 @@ fn init() -> State {
     };
     let local = std::env::var("RUNETERM_LOCAL").is_ok_and(|v| v == "1");
     State::new(&Config::load(), !local, attach)
+}
+
+/// The README's screenshots (`--scene readme`, `readme-float`, `readme-palette`): runeterm's
+/// own code in helix, its git log and its tests, in a session with its animal, a second tab,
+/// and a fourth split minimized to a pill (or, with `float`, floating and pinned).
+/// The programs run in `RUNETERM_DEMO_REPO`, or the current directory.
+fn showcase(s: &mut State, float: bool) {
+    s.session = Some(crate::state::Session { name: "quiet-river".into(), animal: "🦉".into() });
+    s.sidebar.pinned = true;
+    let repo = std::env::var("RUNETERM_DEMO_REPO")
+        .ok()
+        .or_else(|| std::env::current_dir().ok().map(|d| d.display().to_string()))
+        .unwrap_or_default();
+    let editor = s.tabs[0].focused;
+    s.split(Dir::Right);
+    let git = s.tabs[0].focused;
+    s.split(Dir::Down);
+    let tests = s.tabs[0].focused;
+    s.split(Dir::Down);
+    let log = s.tabs[0].focused;
+    s.tabs[0].root.resize(editor, crate::split::Side::Right, -0.04);
+    s.new_tab(None);
+    s.select_tab(0);
+    let run = |s: &State, id: u32, cmd: &str| {
+        if let Some(p) = s.panes.get(&id) {
+            p.send(format!("cd '{repo}' && clear && {cmd}\n").as_bytes());
+        }
+    };
+    run(s, editor, "hx crates/runeterm/src/keys.rs:96");
+    run(s, git, "git --no-pager log --graph --format='%C(yellow)%h%C(reset) %<(52,trunc)%s' --color -n 40");
+    run(s, tests, "cargo test --release -p runeterm 2>&1 | grep -E '^test |test result' | sed -E 's/^test ([a-z_]+::)+/test /' | tail -n 40");
+    run(s, log, "git --no-pager log --color --format='%C(yellow)%h%C(reset) %s%n' --stat=60 -n 1 HEAD~1");
+    std::thread::sleep(std::time::Duration::from_millis(6000));
+    if float {
+        s.toggle_pin(log);
+        if let Some(f) = s.tabs[0].floating.iter_mut().find(|f| f.id == log) {
+            f.rect = [0.4, 0.24, 0.5, 0.34];
+        }
+    } else {
+        s.minimize(log);
+        s.focus(editor);
+    }
+    for p in s.panes.values_mut() {
+        p.refresh_meta(None);
+    }
 }
 
 /// A headless scene: three splits (one minimized), two tabs and real output, for `--snap`.
