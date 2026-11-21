@@ -59,6 +59,14 @@ spooky too.
 - Rename a session from the picker (the pencil on its row) or by double-clicking its name in
   the sidebar; change its animal by clicking its emoji (or right-clicking the badge).
 - Settings: `~/.config/runeterm/config` (written from Ghostty's on first run). ⌥R reloads.
+- Fonts as in Ghostty: `font-family`, and per style `font-style` / `font-style-bold` /
+  `font-style-italic` / `font-style-bold-italic` (a face by name, `Light`, `Medium Italic`, or
+  `false` for the regular face) and `font-family-bold` / `-italic` / `-bold-italic`.
+  Runs of text are shaped, so ligatures and contextual alternates show as in Ghostty;
+  `font-feature = -calt, -liga` turns them off, `ss01` turns a stylistic set on.
+  `font-variation` (and `-bold`, `-italic`, `-bold-italic`) sets a variable font's axes
+  (`wght=450`). A family with no bold or italic face gets a made-up one (emboldened, slanted);
+  `font-synthetic-style = false` (or `no-bold`, `no-italic`, `no-bold-italic`) turns that off.
 - `font-size-fit = 3%` lets the line height (and, if that's not enough, the font size) move by
   up to that much so the lines fill the splits with no blank strip under the last one; the
   appearance section shows what it chose. 0 (the default) keeps them exact. Dividers snap to

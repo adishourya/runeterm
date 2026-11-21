@@ -52,6 +52,136 @@ pub struct FontSpec {
     /// `font-size-fit`: how far (a fraction) the line height and font size may move so the
     /// lines fill the grid with nothing left under the last one; 0 keeps them exact.
     pub fit: f32,
+    /// `font-family-bold`, `-italic`, `-bold-italic`: another family for that style.
+    pub families: [Option<String>; 3],
+    /// `font-style`, `-bold`, `-italic`, `-bold-italic`: the named face for regular, bold,
+    /// italic and bold italic.
+    pub styles: [FontStyle; 4],
+    /// `font-feature`: OpenType features to turn on or off when shaping ("-calt", "ss01").
+    pub features: Vec<(String, u16)>,
+    /// `font-variation`, `-bold`, `-italic`, `-bold-italic`: variable font axes per style
+    /// ("wght=450").
+    pub variations: [Vec<(String, f32)>; 4],
+    /// `font-synthetic-style`: whether bold, italic and bold italic may be made up (emboldened,
+    /// slanted) when the family has no such face.
+    pub synthetic: [bool; 3],
+}
+
+impl Default for FontSpec {
+    fn default() -> Self {
+        FontSpec {
+            family: "monospace".into(),
+            size: 13.0,
+            cell_height: 0.0,
+            cell_height_px: 0.0,
+            padding: 10.0,
+            fit: 0.0,
+            families: Default::default(),
+            styles: Default::default(),
+            features: vec![],
+            variations: Default::default(),
+            synthetic: [true; 3],
+        }
+    }
+}
+
+/// One `font-feature` value: a comma-separated list of `-calt` (off), `+liga` or `liga` (on),
+/// `ss01=2` or `ss01 2` (a value), `calt=off`. None for a tag that isn't four characters.
+pub fn parse_features(v: &str) -> Option<Vec<(String, u16)>> {
+    v.split(',').map(str::trim).filter(|f| !f.is_empty()).map(|f| {
+        let f = f.trim_matches('"');
+        let (tag, value) = if let Some(t) = f.strip_prefix('-') {
+            (t, 0)
+        } else if let Some(t) = f.strip_prefix('+') {
+            (t, 1)
+        } else if let Some((t, v)) = f.split_once(['=', ' ', ':']) {
+            let v = v.trim();
+            (t, match v { "on" | "true" => 1, "off" | "false" => 0, n => n.parse().ok()? })
+        } else {
+            (f, 1)
+        };
+        let tag = tag.trim().trim_matches('"');
+        (tag.len() == 4 && tag.is_ascii()).then(|| (tag.to_string(), value))
+    }).collect()
+}
+
+/// One `font-variation` value: `wght=450`, or several comma-separated.
+pub fn parse_variations(v: &str) -> Option<Vec<(String, f32)>> {
+    v.split(',').map(str::trim).filter(|f| !f.is_empty()).map(|f| {
+        let (tag, value) = f.split_once(['=', ' ', ':'])?;
+        let tag = tag.trim().trim_matches('"');
+        (tag.len() == 4 && tag.is_ascii()).then_some(())?;
+        Some((tag.to_string(), value.trim().parse().ok()?))
+    }).collect()
+}
+
+/// `font-synthetic-style`: `true`, `false`, or a list like `no-bold,italic` changing the
+/// defaults (all on). The order is bold, italic, bold italic.
+pub fn parse_synthetic(v: &str) -> [bool; 3] {
+    match v.trim() {
+        "false" => return [false; 3],
+        "true" | "" => return [true; 3],
+        _ => {}
+    }
+    let mut out = [true; 3];
+    for item in v.split(',').map(str::trim) {
+        let (on, name) = match item.strip_prefix("no-") { Some(n) => (false, n), None => (true, item) };
+        match name {
+            "bold" => out[0] = on,
+            "italic" => out[1] = on,
+            "bold-italic" => out[2] = on,
+            _ => {}
+        }
+    }
+    out
+}
+
+fn tag(name: &str) -> swash::Tag {
+    let b = name.as_bytes();
+    swash::tag_from_bytes(&[b[0], b[1], b[2], b[3]])
+}
+
+/// Which face of a family a style uses (Ghostty's `font-style*`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum FontStyle {
+    /// The family's own: Regular, Bold, Italic, Bold Italic.
+    #[default]
+    Default,
+    /// A face by its style name: "Light", "Medium Italic".
+    Named(String),
+    /// `false`: none; the regular face draws it.
+    Off,
+}
+
+impl FontStyle {
+    pub fn parse(v: &str) -> FontStyle {
+        match v.trim() {
+            "" | "default" => FontStyle::Default,
+            "false" => FontStyle::Off,
+            s => FontStyle::Named(s.to_string()),
+        }
+    }
+}
+
+/// Face `i` (0 regular, 1 bold, 2 italic, 3 bold italic) as a fontconfig pattern: its family
+/// (the style's own or `font-family`) with the style named, or the family's default one. None
+/// when the style is off.
+pub fn font_pattern(spec: &FontSpec, i: usize) -> Option<String> {
+    let family = i.checked_sub(1).and_then(|j| spec.families[j].as_deref()).unwrap_or(&spec.family);
+    match &spec.styles[i] {
+        FontStyle::Off if i > 0 => None,
+        FontStyle::Named(style) => Some(format!("{family}:style={style}")),
+        _ => Some(default_pattern(family, i)),
+    }
+}
+
+fn default_pattern(family: &str, i: usize) -> String {
+    match i {
+        1 => format!("{family}:bold"),
+        2 => format!("{family}:italic"),
+        3 => format!("{family}:bold:italic"),
+        _ => family.to_string(),
+    }
 }
 
 /// The cell size that fills a grid `target` device pixels tall best: a font size (px) and a
@@ -102,40 +232,98 @@ pub fn fitted() -> Option<(f32, f32)> {
 /// symbols the font lacks), by asking fontconfig which installed font covers it.
 struct Fonts {
     data: [Option<Box<[u8]>>; 4],
+    /// What each style's face lacks and is made up when drawn: (embolden, slant).
+    synth: [(bool, bool); 4],
+    features: Vec<swash::Setting<u16>>,
+    variations: [Vec<swash::Setting<f32>>; 4],
     extra: Vec<Box<[u8]>>,
     paths: HashMap<String, usize>,
     by_char: HashMap<char, Option<usize>>,
+    /// `resolve`'s answers, by character and style.
+    resolved: HashMap<(char, usize), Option<(usize, u16)>>,
 }
 
 fn read_font(pattern: &str) -> Option<(String, Box<[u8]>)> {
-    let out = std::process::Command::new("fc-match").args(["-f", "%{file}", pattern]).output().ok()?;
-    let path = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    let path = fc_match(pattern, "%{file}")?;
     let data = std::fs::read(&path).ok()?.into_boxed_slice();
     Some((path, data))
 }
 
+/// What fontconfig says about the best match for `pattern`, in `format`.
+fn fc_match(pattern: &str, format: &str) -> Option<String> {
+    let out = std::process::Command::new("fc-match").args(["-f", format, pattern]).output().ok()?;
+    Some(String::from_utf8(out.stdout).ok()?.trim().to_string())
+}
+
+/// Whether fontconfig's styles for a face (`Light,Regular`) include `want`, ignoring case.
+fn has_style(styles: &str, want: &str) -> bool {
+    styles.split(',').any(|s| s.trim().eq_ignore_ascii_case(want.trim()))
+}
+
 impl Fonts {
-    fn load(family: &str) -> Fonts {
-        let style = |s: &str| {
-            let pattern = if s.is_empty() { family.to_string() } else { format!("{family}:{s}") };
-            read_font(&pattern).map(|(_, d)| d)
-        };
-        Fonts {
-            data: [style(""), style("bold"), style("italic"), style("bold:italic")],
-            extra: vec![],
-            paths: HashMap::new(),
-            by_char: HashMap::new(),
+    fn load(spec: &FontSpec) -> Fonts {
+        let mut data: [Option<Box<[u8]>>; 4] = Default::default();
+        let mut synth = [(false, false); 4];
+        let mut read: HashMap<String, usize> = HashMap::new();
+        for i in 0..4 {
+            let Some(mut pattern) = font_pattern(spec, i) else { continue };
+            // A named style the family doesn't have would get fontconfig's nearest face, which
+            // can be anything: say so and use the family's own style instead.
+            if let FontStyle::Named(want) = &spec.styles[i] {
+                let got = fc_match(&pattern, "%{style}").unwrap_or_default();
+                if !has_style(&got, want) {
+                    let family = pattern.split(":style=").next().unwrap_or_default().to_string();
+                    eprintln!("runeterm: no \"{want}\" style in {family}; using its default");
+                    pattern = default_pattern(&family, i);
+                }
+            }
+            // Faces that come out the same are read once.
+            if let Some(&j) = read.get(&pattern) {
+                data[i] = data[j].clone();
+                continue;
+            }
+            data[i] = read_font(&pattern).map(|(_, d)| d);
+            read.insert(pattern, i);
         }
+        // What fontconfig found, against what the style wants (read from the font files, since
+        // fontconfig reports the weight it was asked for): a family with no bold (or italic)
+        // face gets the nearest one, made bold (or slanted) when drawn, as Ghostty does.
+        let attrs = |d: &Option<Box<[u8]>>| d.as_deref().and_then(|d| FontRef::from_index(d, 0)).map(|f| f.attributes());
+        let regular = attrs(&data[0]).map_or(400, |a| a.weight().0);
+        for i in 1..4 {
+            let Some(a) = attrs(&data[i]) else { continue };
+            if matches!(spec.styles[i], FontStyle::Default) && spec.synthetic[i - 1] {
+                let (bold, italic) = (i & 1 != 0, i & 2 != 0);
+                synth[i] = (bold && a.weight().0 <= regular, italic && a.style() == swash::Style::Normal);
+            }
+        }
+        let features = spec.features.iter().map(|(t, v)| swash::Setting { tag: tag(t), value: *v }).collect();
+        let variations = spec.variations.clone().map(|vs| vs.iter().map(|(t, v)| swash::Setting { tag: tag(t), value: *v }).collect());
+        Fonts { data, synth, features, variations, extra: vec![], paths: HashMap::new(), by_char: HashMap::new(), resolved: HashMap::new() }
+    }
+
+    /// The variable font axes for font `i` (styles only; fallbacks keep their defaults).
+    fn variations(&self, i: usize) -> &[swash::Setting<f32>] {
+        self.variations.get(i).map_or(&[], |v| v.as_slice())
     }
 
     fn get(&self, style: usize) -> Option<FontRef<'_>> {
-        let d = self.data[style].as_deref().or(self.data[style & 1].as_deref()).or(self.data[0].as_deref())?;
+        let d = self.data[style].as_deref().or(self.data[0].as_deref())?;
         FontRef::from_index(d, 0)
     }
 
     /// A font with a glyph for `ch`: the styled one, the regular one, or a fallback.
     /// Returns a font index for `font` (0–3 styles, 4+ fallbacks) and the glyph id.
     fn resolve(&mut self, ch: char, style: usize) -> Option<(usize, u16)> {
+        if let Some(r) = self.resolved.get(&(ch, style)) {
+            return *r;
+        }
+        let r = self.resolve_uncached(ch, style);
+        self.resolved.insert((ch, style), r);
+        r
+    }
+
+    fn resolve_uncached(&mut self, ch: char, style: usize) -> Option<(usize, u16)> {
         for i in [style, 0] {
             if let Some(f) = self.get(i) {
                 let gid = f.charmap().map(ch);
@@ -225,10 +413,39 @@ impl Shelves {
     }
 }
 
+/// What the atlas holds: a character drawn by `sprite` (box drawing, blocks, braille,
+/// powerline), or a font's glyph (0–3 the styles, 4+ fallbacks).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum GlyphKey {
+    Sprite(char),
+    Glyph { font: u16, id: u16 },
+}
+
+/// What one cell draws.
+#[derive(Clone, Debug, PartialEq)]
+enum Draw {
+    /// Its character on its own (sprites, emoji, fallback fonts, blanks).
+    Char,
+    /// One shaped glyph (the usual case): font, glyph, and offset from the cell's left edge and
+    /// baseline (px).
+    One(usize, u16, f32, f32),
+    /// Several shaped glyphs, as `One`.
+    Glyphs(Vec<(usize, u16, f32, f32)>),
+    /// Part of a ligature an earlier cell draws.
+    Covered,
+}
+
+/// Characters `sprite::draw` may draw itself (it says no to the rest of these ranges).
+fn maybe_sprite(c: char) -> bool {
+    matches!(c as u32, 0x2500..=0x259F | 0x2800..=0x28FF | 0xE0B0..=0xE0BF)
+}
+
 /// Glyphs rasterized into textures packed on shelves: coverage (R8) for text, and RGBA for
 /// colour glyphs (emoji).
 struct Atlas {
-    glyphs: HashMap<(char, u8), Option<Slot>>,
+    glyphs: HashMap<GlyphKey, Option<Slot>>,
+    /// Shaped runs by font and text: what each of the run's cells draws.
+    runs: HashMap<(usize, String), Vec<Draw>>,
     mask: Shelves,
     color: Shelves,
     uploads: Vec<(Slot, Vec<u8>)>,
@@ -236,7 +453,7 @@ struct Atlas {
 
 impl Atlas {
     fn new() -> Atlas {
-        Atlas { glyphs: HashMap::new(), mask: Shelves::default(), color: Shelves::default(), uploads: vec![] }
+        Atlas { glyphs: HashMap::new(), runs: HashMap::new(), mask: Shelves::default(), color: Shelves::default(), uploads: vec![] }
     }
 
     /// Finds room for a `w` × `h` bitmap and queues its upload.
@@ -250,36 +467,70 @@ impl Atlas {
         Some(s)
     }
 
-    fn get(&mut self, ctx: &mut ScaleContext, fonts: &mut Fonts, m: &Metrics, ch: char, style: u8) -> Option<Slot> {
-        if let Some(s) = self.glyphs.get(&(ch, style)) {
+    /// A cell's character in style `style` (bold 1, italic 2), unshaped: drawn as a sprite, or
+    /// the glyph of whichever font has it.
+    fn char(&mut self, ctx: &mut ScaleContext, fonts: &mut Fonts, m: &Metrics, ch: char, style: u8) -> Option<Slot> {
+        if maybe_sprite(ch) {
+            let key = GlyphKey::Sprite(ch);
+            if let Some(s) = self.glyphs.get(&key) {
+                if s.is_some() {
+                    return *s;
+                }
+            } else if let Some(sp) = crate::sprite::draw(ch, m.w as u32, m.h as u32, (m.px / 16.0).round().max(1.0)) {
+                // Drawn by us at exactly cell size; its top is the cell's top.
+                let slot = self.pack(sp.w, sp.h, 0, m.baseline as i32, sp.data, false);
+                self.glyphs.insert(key, slot);
+                return slot;
+            } else {
+                self.glyphs.insert(key, None);
+            }
+        }
+        let (fi, gid) = fonts.resolve(ch, style as usize)?;
+        self.glyph(ctx, fonts, m, fi, gid)
+    }
+
+    /// Glyph `gid` of font `fi`, rasterized once: in its style's variation, and emboldened or
+    /// slanted where the family had no such face.
+    fn glyph(&mut self, ctx: &mut ScaleContext, fonts: &Fonts, m: &Metrics, fi: usize, gid: u16) -> Option<Slot> {
+        let key = GlyphKey::Glyph { font: fi as u16, id: gid };
+        if let Some(s) = self.glyphs.get(&key) {
             return *s;
         }
-        let slot = if let Some(sp) = crate::sprite::draw(ch, m.w as u32, m.h as u32, (m.px / 16.0).round().max(1.0)) {
-            // Drawn by us at exactly cell size; its top is the cell's top.
-            self.pack(sp.w, sp.h, 0, m.baseline as i32, sp.data, false)
-        } else {
-            (|| {
-                let (fi, gid) = fonts.resolve(ch, style as usize)?;
-                let font = fonts.font(fi)?;
-                let mut scaler = ctx.builder(font).size(m.px).hint(true).build();
-                if scaler.has_color_bitmaps() || scaler.has_color_outlines() {
-                    // Colour emoji: an RGBA image, scaled into its cells when drawn.
-                    let img = Render::new(&[Source::ColorOutline(0), Source::ColorBitmap(StrikeWith::BestFit), Source::Outline]).render(&mut scaler, gid)?;
-                    let p = img.placement;
-                    if img.content == Content::Color {
-                        return self.pack(p.width, p.height, p.left, p.top, img.data, true);
-                    }
-                    return self.pack(p.width, p.height, p.left, p.top, img.data, false);
-                }
-                let img = Render::new(&[Source::Outline]).format(Format::Alpha).render(&mut scaler, gid)?;
+        let slot = (|| {
+            let font = fonts.font(fi)?;
+            let mut scaler = ctx.builder(font).size(m.px).hint(true).variations(fonts.variations(fi).iter().copied()).build();
+            if scaler.has_color_bitmaps() || scaler.has_color_outlines() {
+                // Colour emoji: an RGBA image, scaled into its cells when drawn.
+                let img = Render::new(&[Source::ColorOutline(0), Source::ColorBitmap(StrikeWith::BestFit), Source::Outline]).render(&mut scaler, gid)?;
                 let p = img.placement;
-                self.pack(p.width, p.height, p.left, p.top, img.data, false)
-            })()
-        };
-        self.glyphs.insert((ch, style), slot);
+                return self.pack(p.width, p.height, p.left, p.top, img.data, img.content == Content::Color);
+            }
+            let (bold, italic) = fonts.synth.get(fi).copied().unwrap_or_default();
+            let mut render = Render::new(&[Source::Outline]);
+            render.format(Format::Alpha);
+            if bold {
+                render.embolden(synthetic_bold(m.px));
+            }
+            if italic {
+                render.transform(Some(swash::zeno::Transform::skew(swash::zeno::Angle::from_degrees(SYNTHETIC_SLANT), swash::zeno::Angle::ZERO)));
+            }
+            let img = render.render(&mut scaler, gid)?;
+            let p = img.placement;
+            self.pack(p.width, p.height, p.left, p.top, img.data, false)
+        })();
+        self.glyphs.insert(key, slot);
         slot
     }
 }
+
+/// How far a made-up bold thickens each side of a stroke, in pixels at `px`: about a quarter
+/// more ink, as a real bold face has over its regular.
+fn synthetic_bold(px: f32) -> f32 {
+    (px / 110.0).max(0.2)
+}
+
+/// How far a made-up italic leans, in degrees (Ghostty's, about 12°).
+const SYNTHETIC_SLANT: f32 = 12.0;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Default)]
@@ -670,6 +921,7 @@ pub struct GridRenderer {
     spec: FontSpec,
     fonts: Fonts,
     ctx: ScaleContext,
+    shaper: swash::shape::ShapeContext,
     metrics: Option<Metrics>,
     atlas: Atlas,
     gpu: Option<Gpu>,
@@ -700,13 +952,14 @@ pub struct GridRenderer {
 
 impl GridRenderer {
     pub fn new(config: &Config) -> GridRenderer {
-        let fonts = Fonts::load(&config.font.family);
+        let fonts = Fonts::load(&config.font);
         let shaders = config.shaders.iter().filter_map(|p| shader::load(p)).collect();
         GridRenderer {
             generation: crate::config::generation(),
             spec: config.font.clone(),
             fonts,
             ctx: ScaleContext::new(),
+            shaper: swash::shape::ShapeContext::new(),
             metrics: None,
             atlas: Atlas::new(),
             gpu: None,
@@ -731,7 +984,7 @@ impl GridRenderer {
     /// rebuilt on the next frame, and every pane redraws (and resizes, if the cell size changed).
     fn reload(&mut self, config: &Config) {
         self.spec = config.font.clone();
-        self.fonts = Fonts::load(&config.font.family);
+        self.fonts = Fonts::load(&config.font);
         self.metrics = None;
         self.fitted = None;
         self.fit_seen = None;
@@ -850,6 +1103,107 @@ impl GridRenderer {
         }
     }
 
+    /// What each cell of a row draws. Runs of cells the same font draws are shaped together
+    /// (`font-feature`: ligatures, contextual alternates), each glyph kept on its cluster's
+    /// cell; a ligature is drawn from its first cell and the cells it covers draw nothing.
+    /// Everything else (sprites, emoji, fallback fonts, lone characters) is drawn per cell.
+    fn shape_row(&mut self, m: &Metrics, cells: &[Cell]) -> Vec<Draw> {
+        let mut out = vec![Draw::Char; cells.len()];
+        // The font a cell's character is shaped with, or None: blank, or drawn on its own.
+        let fonts = &mut self.fonts;
+        let mut font_of = |c: &Cell| -> Option<usize> {
+            let ch = c.text.chars().next().filter(|ch| !ch.is_whitespace())?;
+            if maybe_sprite(ch) {
+                return None;
+            }
+            let style = c.bold as usize | (c.italic as usize) << 1;
+            fonts.resolve(ch, style).map(|(fi, _)| fi).filter(|&fi| fi < 4)
+        };
+        let blank = |c: &Cell| c.text.chars().next().is_none_or(char::is_whitespace);
+        let shaped: Vec<Option<usize>> = cells.iter().map(&mut font_of).collect();
+        let mut x = 0;
+        while x < cells.len() {
+            let Some(fi) = shaped[x] else {
+                x += 1;
+                continue;
+            };
+            // The run: cells in this font, and blanks between them.
+            let mut end = x + 1;
+            let mut last = x;
+            while end < cells.len() {
+                match shaped[end] {
+                    Some(f) if f == fi => last = end,
+                    None if blank(&cells[end]) => {}
+                    _ => break,
+                }
+                end += 1;
+            }
+            let end = last + 1;
+            if end - x >= 2 {
+                self.shape_run(m, cells, x, end, fi, &mut out);
+            }
+            x = end;
+        }
+        out
+    }
+
+    /// Shapes cells `from..to` with font `fi` into `out`, or takes the same run's shaping from
+    /// the cache (rows repeat: prompts, scrolling, redraws).
+    fn shape_run(&mut self, m: &Metrics, cells: &[Cell], from: usize, to: usize, fi: usize, out: &mut [Draw]) {
+        let text: String = cells[from..to].iter().map(|c| c.text.chars().next().filter(|ch| !ch.is_whitespace()).unwrap_or(' ')).collect();
+        let key = (fi, text);
+        if let Some(run) = self.atlas.runs.get(&key) {
+            out[from..to].clone_from_slice(run);
+            return;
+        }
+        let mut run = vec![Draw::Char; to - from];
+        self.shape_text(m, &key.1, fi, &mut run);
+        out[from..to].clone_from_slice(&run);
+        if self.atlas.runs.len() > 8192 {
+            self.atlas.runs.clear();
+        }
+        self.atlas.runs.insert(key, run);
+    }
+
+    /// Shapes `text`, one character per cell, with font `fi`: what each cell draws into `out`.
+    fn shape_text(&mut self, m: &Metrics, text: &str, fi: usize, out: &mut [Draw]) {
+        let Some(font) = self.fonts.font(fi) else { return };
+        // The cell each byte of `text` came from.
+        let mut cell_of: Vec<usize> = vec![];
+        for (i, (at, ch)) in text.char_indices().enumerate() {
+            cell_of.resize(at + ch.len_utf8(), i);
+        }
+        let mut shaper = self
+            .shaper
+            .builder(font)
+            .script(swash::text::Script::Latin)
+            .size(m.px)
+            .features(self.fonts.features.iter().copied())
+            .variations(self.fonts.variations(fi).iter().copied())
+            .build();
+        shaper.add_str(&text);
+        shaper.shape_with(|c| {
+            let (start, end) = (c.source.start as usize, c.source.end as usize);
+            let Some(&cell) = cell_of.get(start) else { return };
+            out[cell] = match c.glyphs {
+                [g] => Draw::One(fi, g.id, g.x, g.y),
+                glyphs => {
+                    let mut pen = 0.0;
+                    Draw::Glyphs(glyphs.iter().map(|g| {
+                        let at = (fi, g.id, pen + g.x, g.y);
+                        pen += g.advance;
+                        at
+                    }).collect())
+                }
+            };
+            for b in start + 1..end.min(cell_of.len()) {
+                if cell_of[b] != cell {
+                    out[cell_of[b]] = Draw::Covered;
+                }
+            }
+        });
+    }
+
     /// Builds one row's instances.
     fn build_row(&mut self, m: Metrics, pad: f32, y: usize, cells: &[Cell], frame_fg: Rgb) -> Row {
         let mut row = Row::default();
@@ -858,6 +1212,7 @@ impl GridRenderer {
         let mix = |a: u8, b: u8| ((a as f32) * 0.38 + (b as f32) * 0.62).round() as u8;
         let (ac, bg) = (self.accent, self.theme.bg);
         let sel_bg = Rgb(mix(ac.0, bg.0), mix(ac.1, bg.1), mix(ac.2, bg.2));
+        let draws = self.shape_row(&m, cells);
         for (x, c) in cells.iter().enumerate() {
             let left = pad + x as f32 * m.w;
             let bg = if c.selected { Some(sel_bg) } else { c.bg };
@@ -872,9 +1227,41 @@ impl GridRenderer {
             }
             let _ = frame_fg;
             let fg = c.fg; // selected text keeps its colour on the tinted background
+            let one;
+            let shaped: &[(usize, u16, f32, f32)] = match &draws[x] {
+                Draw::One(fi, gid, dx, dy) => {
+                    one = [(*fi, *gid, *dx, *dy)];
+                    &one
+                }
+                Draw::Glyphs(g) => g,
+                _ => &[],
+            };
+            match &draws[x] {
+                Draw::Covered => {}
+                Draw::One(..) | Draw::Glyphs(_) => {
+                    for &(fi, gid, dx, dy) in shaped {
+                        if let Some(s) = self.atlas.glyph(&mut self.ctx, &self.fonts, &m, fi, gid) {
+                            row.fg.push(Inst {
+                                pos: [(left + dx + s.left as f32).round(), (top + m.baseline - dy - s.top as f32).round()],
+                                size: [s.w as f32, s.h as f32],
+                                uv: [s.x as f32, s.y as f32],
+                                color: rgba(fg, 1.0),
+                                kind: if s.color { 4 } else { 1 },
+                                ..Default::default()
+                            });
+                            if s.color {
+                                let i = row.fg.last_mut().unwrap();
+                                i.uv = [s.x as f32 / ATLAS as f32, s.y as f32 / ATLAS as f32];
+                                i.uv_size = [s.w as f32 / ATLAS as f32, s.h as f32 / ATLAS as f32];
+                                i.color = [1.0; 4];
+                            }
+                        }
+                    }
+                }
+                Draw::Char => {
             if let Some(ch) = c.text.chars().next().filter(|ch| !ch.is_whitespace()) {
                 let style = c.bold as u8 | (c.italic as u8) << 1;
-                if let Some(s) = self.atlas.get(&mut self.ctx, &mut self.fonts, &m, ch, style).filter(|s| s.color) {
+                if let Some(s) = self.atlas.char(&mut self.ctx, &mut self.fonts, &m, ch, style).filter(|s| s.color) {
                     // An emoji fills the height of its two cells, centred, keeping its shape.
                     let span = if cells.get(x + 1).is_some_and(|n| n.text.is_empty()) { 2.0 } else { 1.0 };
                     let h = (m.h * 0.86).min(span * m.w * s.h as f32 / s.w as f32);
@@ -888,7 +1275,7 @@ impl GridRenderer {
                         kind: 4,
                         _pad: 0,
                     });
-                } else if let Some(s) = self.atlas.get(&mut self.ctx, &mut self.fonts, &m, ch, style) {
+                } else if let Some(s) = self.atlas.char(&mut self.ctx, &mut self.fonts, &m, ch, style) {
                     row.fg.push(Inst {
                         pos: [(left + s.left as f32).round(), (top + m.baseline - s.top as f32).round()],
                         size: [s.w as f32, s.h as f32],
@@ -897,6 +1284,8 @@ impl GridRenderer {
                         kind: 1,
                         ..Default::default()
                     });
+                }
+            }
                 }
             }
             if c.underline {
@@ -1400,6 +1789,84 @@ impl Compositor<State> for GridRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn spec(family: &str) -> FontSpec {
+        FontSpec { family: family.into(), padding: 0.0, ..FontSpec::default() }
+    }
+
+    #[test]
+    fn font_patterns_follow_styles_and_families() {
+        let mut s = spec("Spline Sans Mono");
+        assert_eq!(font_pattern(&s, 0).as_deref(), Some("Spline Sans Mono"));
+        assert_eq!(font_pattern(&s, 3).as_deref(), Some("Spline Sans Mono:bold:italic"));
+        s.styles = [FontStyle::parse("Light"), FontStyle::parse("Medium"), FontStyle::parse("false"), FontStyle::parse("")];
+        assert_eq!(font_pattern(&s, 0).as_deref(), Some("Spline Sans Mono:style=Light"));
+        assert_eq!(font_pattern(&s, 1).as_deref(), Some("Spline Sans Mono:style=Medium"));
+        assert_eq!(font_pattern(&s, 2), None, "italic is off");
+        assert_eq!(font_pattern(&s, 3).as_deref(), Some("Spline Sans Mono:bold:italic"));
+        s.families[2] = Some("Victor Mono".into());
+        assert_eq!(font_pattern(&s, 3).as_deref(), Some("Victor Mono:bold:italic"));
+        // Regular can't be turned off.
+        s.styles[0] = FontStyle::Off;
+        assert_eq!(font_pattern(&s, 0).as_deref(), Some("Spline Sans Mono"));
+    }
+
+    #[test]
+    fn font_features_read_like_ghosttys() {
+        assert_eq!(parse_features("-calt"), Some(vec![("calt".into(), 0)]));
+        assert_eq!(parse_features("+liga, ss01=2, zero, dlig=off"), Some(vec![("liga".into(), 1), ("ss01".into(), 2), ("zero".into(), 1), ("dlig".into(), 0)]));
+        assert_eq!(parse_features("toolong"), None);
+        assert_eq!(parse_variations("wght=450, slnt=-10"), Some(vec![("wght".into(), 450.0), ("slnt".into(), -10.0)]));
+        assert_eq!(parse_variations("wght"), None);
+        assert_eq!(parse_synthetic("false"), [false; 3]);
+        assert_eq!(parse_synthetic("no-bold,no-bold-italic"), [false, true, false]);
+        assert_eq!(parse_synthetic("true"), [true; 3]);
+    }
+
+    fn cells(text: &str) -> Vec<Cell> {
+        text.chars().map(|c| Cell { text: c.to_string(), ..Default::default() }).collect()
+    }
+
+    /// Shaping on a real ligature font (skipped where it isn't installed): JetBrains Mono turns
+    /// `->` into an arrow made of its own glyphs, one per cell, and `-calt` keeps the plain ones.
+    /// Plain words keep one glyph per cell, at the cell's own left edge.
+    #[test]
+    fn runs_are_shaped_with_the_configured_features() {
+        let family = "JetBrainsMono Nerd Font Mono";
+        if !fc_match(family, "%{family}").is_some_and(|f| f.contains("JetBrains")) {
+            return;
+        }
+        let shape = |extra: &str| {
+            let mut c = Config::default();
+            c.apply(&format!("font-family = {family}\n{extra}"), std::path::Path::new("/"));
+            let mut g = GridRenderer::new(&c);
+            let m = g.metrics_at(1.0);
+            g.shape_row(&m, &cells("a -> b"))
+        };
+        let on = shape("");
+        let off = shape("font-feature = -calt, -liga\n");
+        let ids = |d: &[Draw]| d.iter().map(|d| match d { Draw::One(_, id, ..) => *id, _ => 0 }).collect::<Vec<_>>();
+        assert_ne!(ids(&on)[2..4], ids(&off)[2..4], "the arrow's glyphs change with calt");
+        assert_eq!(ids(&on)[0], ids(&off)[0], "a letter stays itself");
+        assert!(matches!(on[0], Draw::One(0, _, x, _) if x == 0.0), "at its cell's left edge");
+        // A lone character isn't shaped.
+        assert_eq!(shape("")[..1], [Draw::One(0, ids(&on)[0], 0.0, 0.0)]);
+        let lone = {
+            let mut c = Config::default();
+            c.apply(&format!("font-family = {family}\n"), std::path::Path::new("/"));
+            let mut g = GridRenderer::new(&c);
+            let m = g.metrics_at(1.0);
+            g.shape_row(&m, &cells("x"))
+        };
+        assert_eq!(lone, vec![Draw::Char]);
+    }
+
+    #[test]
+    fn styles_are_matched_by_name() {
+        assert!(has_style("Light,Regular", "light"));
+        assert!(has_style("Medium Italic,Italic", "Medium Italic"));
+        assert!(!has_style("Regular", "Light"));
+    }
 
     /// A font whose own line height is 1.2× its size.
     fn natural(px: f32) -> f32 {

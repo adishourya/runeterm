@@ -3,7 +3,7 @@
 //! writes the file from Ghostty's config (font, colours, cursor, shaders) so nothing changes
 //! visually, and copies Ghostty's shaders next to it. ⌥R reloads it.
 
-use crate::grid::FontSpec;
+use crate::grid::{FontSpec, FontStyle, parse_features, parse_synthetic, parse_variations};
 use crate::pane::Theme;
 use crate::vt::{CursorStyle, Rgb};
 use std::path::{Path, PathBuf};
@@ -89,7 +89,7 @@ impl Default for Config {
         ]
         .map(|h| rgb(h).unwrap());
         Config {
-            font: FontSpec { family: "monospace".into(), size: 13.0, cell_height: 0.0, cell_height_px: 0.0, padding: 10.0, fit: 0.0 },
+            font: FontSpec::default(),
             theme: Theme { fg: Rgb(255, 255, 255), bg: Rgb(0x10, 0x10, 0x10), cursor: Rgb(0xcc, 0xcc, 0xcc), ansi, cursor_style: CursorStyle::Bar },
             cursor_style: CursorStyle::Bar,
             cursor_opacity: 1.0,
@@ -213,6 +213,18 @@ impl Config {
              \n\
              # --- Font ---\n\
              font-family = {}\n\
+             # Another family for bold, italic or bold italic (default: font-family).\n\
+             {families}\
+             # A face by its style name, as fc-list shows it (Light, Medium Italic), or false\n\
+             # to draw that style with the regular face.\n\
+             {styles}\
+             # Make up bold and italic when the family has none (true, false, or no-bold,\n\
+             # no-italic, no-bold-italic).\n\
+             font-synthetic-style = {synthetic}\n\
+             # OpenType features: -calt -liga turn ligatures off, ss01 turns a set on.\n\
+             {features}\
+             # Axes of a variable font, per style: wght=450.\n\
+             {variations}\
              # In points, as in Ghostty.\n\
              font-size = {}\n\
              # Extra space between lines: a percentage (31%) or pixels (4).\n\
@@ -292,6 +304,30 @@ impl Config {
             self.sidebar.host,
             editor = self.scrollback_editor,
             keybinds = keybind_section(),
+            synthetic = match f.synthetic {
+                [true, true, true] => "true".to_string(),
+                [false, false, false] => "false".to_string(),
+                s => ["bold", "italic", "bold-italic"].iter().zip(s).map(|(n, on)| if on { n.to_string() } else { format!("no-{n}") }).collect::<Vec<_>>().join(","),
+            },
+            features = if f.features.is_empty() {
+                "# font-feature = -calt, -liga\n".to_string()
+            } else {
+                format!("font-feature = {}\n", f.features.iter().map(|(t, v)| match v { 0 => format!("-{t}"), 1 => t.clone(), v => format!("{t}={v}") }).collect::<Vec<_>>().join(", "))
+            },
+            variations = ["", "-bold", "-italic", "-bold-italic"].iter().zip(&f.variations).map(|(k, vs)| if vs.is_empty() {
+                if k.is_empty() { "# font-variation = wght=450\n".to_string() } else { String::new() }
+            } else {
+                format!("font-variation{k} = {}\n", vs.iter().map(|(t, v)| format!("{t}={v}")).collect::<Vec<_>>().join(", "))
+            }).collect::<String>(),
+            families = ["bold", "italic", "bold-italic"].iter().zip(&f.families).map(|(k, v)| match v {
+                Some(v) => format!("font-family-{k} = {v}\n"),
+                None => format!("# font-family-{k} = \n"),
+            }).collect::<String>(),
+            styles = ["", "-bold", "-italic", "-bold-italic"].iter().zip(&f.styles).map(|(k, v)| match v {
+                FontStyle::Named(v) => format!("font-style{k} = {v}\n"),
+                FontStyle::Off => format!("font-style{k} = false\n"),
+                FontStyle::Default => format!("# font-style{k} = \n"),
+            }).collect::<String>(),
             copy_on_select = self.copy_on_select,
             confirm_close = self.confirm_close,
             notifications = self.notifications,
@@ -313,6 +349,31 @@ impl Config {
             match k {
                 "font-family" if !v.is_empty() => self.font.family = v.to_string(),
                 "font-size" => self.font.size = v.parse().unwrap_or(self.font.size),
+                "font-family-bold" => self.font.families[0] = Some(v.to_string()).filter(|v| !v.is_empty()),
+                "font-family-italic" => self.font.families[1] = Some(v.to_string()).filter(|v| !v.is_empty()),
+                "font-family-bold-italic" => self.font.families[2] = Some(v.to_string()).filter(|v| !v.is_empty()),
+                "font-style" => self.font.styles[0] = FontStyle::parse(v),
+                "font-style-bold" => self.font.styles[1] = FontStyle::parse(v),
+                "font-style-italic" => self.font.styles[2] = FontStyle::parse(v),
+                "font-style-bold-italic" => self.font.styles[3] = FontStyle::parse(v),
+                "font-synthetic-style" => self.font.synthetic = parse_synthetic(v),
+                // Each line adds to the list; an empty one clears it, as in Ghostty.
+                "font-feature" if v.is_empty() => self.font.features.clear(),
+                "font-feature" => match parse_features(v) {
+                    Some(f) => self.font.features.extend(f),
+                    None => eprintln!("runeterm: font-feature = {v}: not a feature (e.g. -calt, ss01)"),
+                },
+                "font-variation" | "font-variation-bold" | "font-variation-italic" | "font-variation-bold-italic" => {
+                    let i = match k { "font-variation" => 0, "font-variation-bold" => 1, "font-variation-italic" => 2, _ => 3 };
+                    if v.is_empty() {
+                        self.font.variations[i].clear();
+                    } else {
+                        match parse_variations(v) {
+                            Some(vs) => self.font.variations[i].extend(vs),
+                            None => eprintln!("runeterm: {k} = {v}: not an axis setting (e.g. wght=450)"),
+                        }
+                    }
+                }
                 // A percentage of the font's line height, or pixels (Ghostty's meaning of a
                 // bare number).
                 "line-height" | "adjust-cell-height" => {
@@ -527,11 +588,19 @@ mod tests {
     #[test]
     fn the_written_file_reads_back_the_same() {
         let mut c = Config::default();
-        c.apply("font-family = X\nfont-size = 19\nline-height = 30%\ncursor-opacity = 0\nbackground = #121212\n", Path::new("/"));
+        c.apply("font-family = X\nfont-size = 19\nline-height = 30%\ncursor-opacity = 0\nbackground = #121212\nfont-style = Light\nfont-style-italic = false\nfont-family-bold = Y\nfont-feature = -calt, ss01\nfont-variation-bold = wght=650\nfont-synthetic-style = no-italic\n", Path::new("/"));
         let text = c.render(&["shaders/a.glsl".into()]);
         let mut back = Config::default();
         back.apply(&text, Path::new("/cfg"));
         assert_eq!(back.font.family, "X");
+        assert_eq!(back.font.styles, c.font.styles);
+        assert_eq!(back.font.styles[0], FontStyle::Named("Light".into()));
+        assert_eq!(back.font.styles[2], FontStyle::Off);
+        assert_eq!(back.font.families, [Some("Y".into()), None, None]);
+        assert_eq!(back.font.features, c.font.features);
+        assert_eq!(back.font.variations, c.font.variations);
+        assert_eq!(back.font.synthetic, [true, false, true]);
+
         assert_eq!(back.font.size, 19.0);
         assert!((back.font.cell_height - 0.30).abs() < 1e-6);
         assert_eq!(back.theme.bg, Rgb(0x12, 0x12, 0x12));
@@ -541,5 +610,17 @@ mod tests {
         assert_eq!(back.sidebar, c.sidebar);
         assert_eq!((back.accent, back.accents.clone(), back.scrollback_editor.clone()), (c.accent, c.accents.clone(), c.scrollback_editor.clone()));
         assert_eq!(back.light, c.light);
+    }
+
+    #[test]
+    fn reads_font_features_variations_and_synthesis() {
+        let mut c = Config::default();
+        c.apply("font-feature = -calt\nfont-feature = -liga, ss02\nfont-variation = wght=350\nfont-variation-bold = wght=650\nfont-synthetic-style = no-italic\n", Path::new("/"));
+        assert_eq!(c.font.features, vec![("calt".into(), 0), ("liga".into(), 0), ("ss02".into(), 1)]);
+        assert_eq!(c.font.variations[0], vec![("wght".into(), 350.0)]);
+        assert_eq!(c.font.variations[1], vec![("wght".into(), 650.0)]);
+        assert_eq!(c.font.synthetic, [true, false, true]);
+        c.apply("font-feature =\n", Path::new("/"));
+        assert!(c.font.features.is_empty(), "an empty line clears the list");
     }
 }
