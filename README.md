@@ -35,6 +35,11 @@ outlive the window and come back after a reboot.
   </tr>
 </table>
 
+![The command palette at work: typing to float the editor split, pin it, open a new tab with it still in view, and go back to the first tab](assets/screenshots/palette.gif)
+
+Everything above is a few keystrokes from the palette: Alt+P, a word or two, Enter. Here it
+floats the editor, pins it, opens a new tab (the pinned split comes along) and goes back.
+
 ![The same splits with the sidebar collapsed to a rail of the session, the time and the tabs](assets/screenshots/rail.png)
 
 With the sidebar collapsed (Alt+/, or `sidebar = hover`), it shrinks to a rail of the session's
@@ -146,7 +151,8 @@ through spooky too.
 The screenshots are rendered headless from scenes in `crates/runeterm/src/ui.rs`:
 `runeterm --scene readme --snap splits.png --size 1600x1000` (also `readme-rail`,
 `readme-palette` and `readme-float`), run from the repository; the light one is `readme` with
-`theme = light`.
+`theme = light`. The palette GIF is recorded from the same scene with
+`--script assets/screenshots/palette-demo.json --video palette.mp4 --duration 12 --keys`.
 
 ## License
 

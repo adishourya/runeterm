@@ -1,0 +1,14 @@
+[
+  {"t": 0.8, "type": "key", "name": "p", "alt": true},
+  {"t": 1.4, "type": "type", "text": "float", "every": 0.11},
+  {"t": 2.5, "type": "key", "name": "Enter"},
+  {"t": 3.7, "type": "key", "name": "p", "alt": true},
+  {"t": 4.2, "type": "type", "text": "pin", "every": 0.11},
+  {"t": 5.0, "type": "key", "name": "Enter"},
+  {"t": 6.2, "type": "key", "name": "p", "alt": true},
+  {"t": 6.7, "type": "type", "text": "new tab", "every": 0.11},
+  {"t": 7.8, "type": "key", "name": "Enter"},
+  {"t": 9.2, "type": "key", "name": "p", "alt": true},
+  {"t": 9.7, "type": "type", "text": "tab 1", "every": 0.11},
+  {"t": 10.6, "type": "key", "name": "Enter"}
+]
