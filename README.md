@@ -40,6 +40,12 @@ outlive the window and come back after a reboot.
 With the sidebar collapsed (Alt+/, or `sidebar = hover`), it shrinks to a rail of the session's
 badge, the time, the battery and a tile per tab, and opens over the splits on hover.
 
+![runeterm in light mode: the same splits and sidebar on light surfaces, with helix in a light theme](assets/screenshots/light.png)
+
+Light mode (`theme = light`, or the sun in the sidebar) switches the chrome and the terminal
+colours together; the light colours are `light-background`, `light-foreground` and
+`light-palette` in the config.
+
 ## Build
 
 libghostty-vt is built once into `vendor/`:
@@ -139,7 +145,8 @@ through spooky too.
 
 The screenshots are rendered headless from scenes in `crates/runeterm/src/ui.rs`:
 `runeterm --scene readme --snap splits.png --size 1600x1000` (also `readme-rail`,
-`readme-palette` and `readme-float`), run from the repository.
+`readme-palette` and `readme-float`), run from the repository; the light one is `readme` with
+`theme = light`.
 
 ## License
 
