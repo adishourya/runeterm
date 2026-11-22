@@ -1164,6 +1164,10 @@ pub fn spec() -> AppSpec<State> {
                 s.split(Dir::Right);
             }),
             ("readme", |s| showcase(s, false)),
+            ("readme-rail", |s| {
+                showcase(s, false);
+                s.sidebar.pinned = false;
+            }),
             ("readme-float", |s| showcase(s, true)),
             ("readme-palette", |s| {
                 showcase(s, false);
@@ -1211,7 +1215,7 @@ fn init() -> State {
     State::new(&Config::load(), !local, attach)
 }
 
-/// The README's screenshots (`--scene readme`, `readme-float`, `readme-palette`): runeterm's
+/// The README's screenshots (`--scene readme`, `readme-rail`, `readme-float`, `readme-palette`): runeterm's
 /// own code in helix, its git log and its tests, in a session with its animal, a second tab,
 /// and a fourth split minimized to a pill (or, with `float`, floating and pinned).
 /// The programs run in `RUNETERM_DEMO_REPO`, or the current directory.

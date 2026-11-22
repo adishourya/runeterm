@@ -35,6 +35,11 @@ outlive the window and come back after a reboot.
   </tr>
 </table>
 
+![The same splits with the sidebar collapsed to a rail of the session, the time and the tabs](assets/screenshots/rail.png)
+
+With the sidebar collapsed (Alt+/, or `sidebar = hover`), it shrinks to a rail of the session's
+badge, the time, the battery and a tile per tab, and opens over the splits on hover.
+
 ## Build
 
 libghostty-vt is built once into `vendor/`:
@@ -133,8 +138,8 @@ Parsing runs 5 to 15 times faster than a pty delivers, a full redraw uses about 
 through spooky too.
 
 The screenshots are rendered headless from scenes in `crates/runeterm/src/ui.rs`:
-`runeterm --scene readme --snap splits.png --size 1600x1000` (also `readme-palette` and
-`readme-float`), run from the repository.
+`runeterm --scene readme --snap splits.png --size 1600x1000` (also `readme-rail`,
+`readme-palette` and `readme-float`), run from the repository.
 
 ## License
 
