@@ -2,7 +2,7 @@
 //! keys to the focused pane.
 
 use crate::config::Config;
-use crate::keys::{Action, Keybinds};
+use crate::keys::{Action, Axis, Keybinds};
 use crate::pane::{Pane, Source, Theme};
 use crate::spooky::{self, Controller, Event, SessionInfo};
 use crate::split::{Dir, Node, Place, Side};
@@ -87,38 +87,44 @@ impl Tab {
 pub struct Palette {
     pub edit: rune::TextEdit,
     pub chosen: usize,
-    /// Set while the palette lists font weights instead of actions.
-    pub weight: Option<WeightPick>,
+    /// Set while the palette lists a font axis's values (weights, widths) instead of actions.
+    pub pick: Option<AxisPick>,
 }
 
-/// The palette's font weight list: for which style, and the font's weight axis.
-pub struct WeightPick {
-    /// 0 regular, 1 bold.
+/// The palette's list of a font axis's values: which axis, for which style, and its range.
+pub struct AxisPick {
+    pub axis: Axis,
+    /// 0 regular, 1 bold. A width is every style's, and saved as regular's.
     pub style: u8,
-    /// The face's family, for saying it has no weight axis.
+    /// The face's family, for saying it has no such axis.
     pub family: String,
-    /// The `wght` axis: (min, default, max), None for a font that isn't variable in weight.
-    pub axis: Option<(f32, f32, f32)>,
-    /// The weight in the config now.
+    /// The axis: (min, default, max), None for a font that doesn't vary on it.
+    pub range: Option<(f32, f32, f32)>,
+    /// The value in the config now.
     pub current: f32,
-    /// A weight is being shown that isn't saved: put the config's back when closed.
+    /// A value is being shown that isn't saved: put the config's back when closed.
     pub previewed: bool,
 }
 
-/// A weight's usual name ("Light" for 300), or "Weight" between them.
-fn weight_name(w: u16) -> &'static str {
-    match w {
-        100 => "Thin",
-        200 => "ExtraLight",
-        300 => "Light",
-        400 => "Regular",
-        500 => "Medium",
-        600 => "SemiBold",
-        700 => "Bold",
-        800 => "ExtraBold",
-        900 => "Black",
-        _ => "Weight",
-    }
+/// An axis value's usual name ("Light" for wght 300, "SemiCondensed" for wdth 87.5), or the
+/// axis's between them.
+fn axis_name(axis: Axis, v: f32) -> &'static str {
+    let named: &[(f32, &str)] = match axis {
+        Axis::Weight => &[(100.0, "Thin"), (200.0, "ExtraLight"), (300.0, "Light"), (400.0, "Regular"), (500.0, "Medium"),
+            (600.0, "SemiBold"), (700.0, "Bold"), (800.0, "ExtraBold"), (900.0, "Black")],
+        Axis::Width => &[(50.0, "UltraCondensed"), (62.5, "ExtraCondensed"), (75.0, "Condensed"), (87.5, "SemiCondensed"),
+            (100.0, "Normal"), (112.5, "SemiExpanded"), (125.0, "Expanded"), (150.0, "ExtraExpanded"), (200.0, "UltraExpanded")],
+    };
+    let between = match axis {
+        Axis::Weight => "Weight",
+        Axis::Width => "Width",
+    };
+    named.iter().find(|(n, _)| *n == v).map_or(between, |(_, name)| name)
+}
+
+/// Tenths, as the palette's rows carry values (87.5 is 875).
+fn tenths(v: f32) -> u32 {
+    (v * 10.0).round().max(0.0) as u32
 }
 
 /// What the session picker shows.
@@ -1213,9 +1219,10 @@ impl State {
             Action::ToggleSidebar => self.toggle_sidebar(),
             Action::ToggleTheme => self.set_light(!self.light),
             Action::ToggleSmoothCursor => self.set_smooth_cursor(!Config::load().cursor_smooth),
-            Action::FontWeight => self.open_weights(0, tx),
-            Action::BoldFontWeight => self.open_weights(1, tx),
-            Action::SetWeight(style, w) => self.set_weight(style, w),
+            Action::FontWeight => self.open_axis(Axis::Weight, 0, tx),
+            Action::BoldFontWeight => self.open_axis(Axis::Weight, 1, tx),
+            Action::FontWidth => self.open_axis(Axis::Width, 0, tx),
+            Action::SetAxis(axis, style, v) => self.set_axis(axis, style, v),
             Action::EditScrollback => self.edit_scrollback(),
             Action::ReloadConfig => self.reload_config(),
             Action::Copy => {
@@ -1232,41 +1239,48 @@ impl State {
         if self.palette.is_some() {
             self.close_palette();
         } else {
-            self.palette = Some(Palette { edit: rune::TextEdit::new(""), chosen: 0, weight: None });
+            self.palette = Some(Palette { edit: rune::TextEdit::new(""), chosen: 0, pick: None });
             tx.focus("palette-field", false);
         }
     }
 
     /// Closes the palette, undoing a weight it was showing but didn't save.
     pub fn close_palette(&mut self) {
-        if self.palette.take().is_some_and(|p| p.weight.is_some_and(|w| w.previewed)) {
+        if self.palette.take().is_some_and(|p| p.pick.is_some_and(|w| w.previewed)) {
             crate::config::publish(Config::load());
         }
     }
 
-    /// Opens the palette on the font's weights for `style` (0 regular, 1 bold), on the one in
-    /// use now.
-    pub fn open_weights(&mut self, style: u8, tx: &mut Tx) {
+    /// Opens the palette on the font's values for `axis` and `style` (0 regular, 1 bold), on
+    /// the one in use now.
+    pub fn open_axis(&mut self, axis: Axis, style: u8, tx: &mut Tx) {
         let spec = Config::load().font;
         let i = style as usize;
-        let axis = crate::grid::weight_axis(&spec, i);
+        let range = crate::grid::font_axis(&spec, i, axis.tag());
         let family = i.checked_sub(1).and_then(|j| spec.families[j].clone()).unwrap_or_else(|| spec.family.clone());
-        let current = spec.variations[i].iter().find(|(t, _)| t == "wght").map(|(_, v)| *v)
-            .or(axis.map(|a| a.1)).unwrap_or(400.0);
-        let pick = WeightPick { style, family, axis, current, previewed: false };
-        self.palette = Some(Palette { edit: rune::TextEdit::new(""), chosen: 0, weight: Some(pick) });
-        let at = self.palette_items().iter().position(|r| matches!(r.0, Action::SetWeight(_, w) if w as f32 == current.round()));
+        let set = match axis {
+            Axis::Weight => spec.variations[i].iter().find(|(t, _)| t == "wght").map(|(_, v)| *v),
+            Axis::Width => crate::grid::shared_width(&spec.variations),
+        };
+        let current = set.or(range.map(|r| r.1)).unwrap_or(400.0);
+        let pick = AxisPick { axis, style, family, range, current, previewed: false };
+        self.palette = Some(Palette { edit: rune::TextEdit::new(""), chosen: 0, pick: Some(pick) });
+        let at = self.palette_items().iter().position(|r| matches!(r.0, Action::SetAxis(_, _, v) if v == tenths(current)));
         if let Some(p) = self.palette.as_mut() {
             p.chosen = at.unwrap_or(0);
         }
         tx.focus("palette-field", false);
     }
 
-    /// Saves weight `w` for `style` as its `font-variation` (other axes kept) and applies it.
-    pub fn set_weight(&mut self, style: u8, w: u16) {
-        let i = style as usize;
-        let vs = crate::grid::with_weight(&Config::load().font.variations[i], w as f32);
-        let key = ["font-variation", "font-variation-bold"][i.min(1)];
+    /// Saves `axis` at `v` tenths for `style` in its `font-variation` (other axes kept) and
+    /// applies it. A width goes in regular's, which every style takes.
+    pub fn set_axis(&mut self, axis: Axis, style: u8, v: u32) {
+        let i = match axis {
+            Axis::Weight => (style as usize).min(1),
+            Axis::Width => 0,
+        };
+        let vs = crate::grid::with_axis(&Config::load().font.variations[i], axis.tag(), v as f32 / 10.0);
+        let key = ["font-variation", "font-variation-bold"][i];
         let value = vs.iter().map(|(t, v)| format!("{t}={v}")).collect::<Vec<_>>().join(", ");
         if let Err(e) = crate::config::replace(key, &value) {
             eprintln!("runeterm: can't save {key}: {e}");
@@ -1274,48 +1288,57 @@ impl State {
         self.reload_config();
     }
 
-    /// Shows the chosen weight row's weight in every terminal, without saving it.
-    fn preview_weight(&mut self) {
-        let Some(Action::SetWeight(style, w)) = self.palette.as_ref().and_then(|p| self.palette_items().get(p.chosen).map(|r| r.0)) else { return };
+    /// Shows the chosen row's value in every terminal, without saving it.
+    fn preview_axis(&mut self) {
+        let Some(Action::SetAxis(axis, style, v)) = self.palette.as_ref().and_then(|p| self.palette_items().get(p.chosen).map(|r| r.0)) else { return };
         let mut c = Config::load();
-        let i = style as usize;
-        c.font.variations[i] = crate::grid::with_weight(&c.font.variations[i], w as f32);
+        let i = if axis == Axis::Width { 0 } else { style as usize };
+        c.font.variations[i] = crate::grid::with_axis(&c.font.variations[i], axis.tag(), v as f32 / 10.0);
         crate::config::publish(c);
-        if let Some(pick) = self.palette.as_mut().and_then(|p| p.weight.as_mut()) {
+        if let Some(pick) = self.palette.as_mut().and_then(|p| p.pick.as_mut()) {
             pick.previewed = true;
         }
     }
 
     /// What the palette says when it has no rows.
     pub fn palette_empty(&self) -> String {
-        match self.palette.as_ref().and_then(|p| p.weight.as_ref()) {
-            Some(w) if w.axis.is_none() => format!("{} has no weight axis (pick a face with font-style instead)", w.family),
-            Some(_) => "No such weight".into(),
+        match self.palette.as_ref().and_then(|p| p.pick.as_ref()) {
+            Some(p) if p.range.is_none() && p.axis == Axis::Weight => format!("{} has no weight axis (pick a face with font-style instead)", p.family),
+            Some(p) if p.range.is_none() => format!("{} has no width axis", p.family),
+            Some(_) => "Not in the font's range".into(),
             None => "No matching command".into(),
         }
     }
 
-    /// The weight list's rows: the font's range in hundreds, its ends, its default, the
-    /// current weight and a number typed, lightest first. The chip says which is in use.
-    fn weight_items(w: &WeightPick, query: &str) -> Vec<(Action, String, String)> {
-        let Some((lo, def, hi)) = w.axis else { return vec![] };
+    /// An axis list's rows: the axis's named values in its range (weights in hundreds,
+    /// Condensed to Expanded), its ends, its default, the current value and a number typed,
+    /// smallest first. The chip says which is in use.
+    fn axis_items(p: &AxisPick, query: &str) -> Vec<(Action, String, String)> {
+        let Some((lo, def, hi)) = p.range else { return vec![] };
         let query = query.trim();
         let typed = query.parse::<f32>().ok();
-        let r = |x: f32| x.clamp(lo, hi).round() as u16;
-        let mut ws: Vec<u16> = (1..=9).map(|n| n * 100).filter(|&n| (lo..=hi).contains(&(n as f32))).collect();
-        ws.extend([r(lo), r(def), r(hi), r(w.current)]);
-        ws.extend(typed.filter(|t| (lo..=hi).contains(t)).map(r));
-        ws.sort();
-        ws.dedup();
-        ws.into_iter()
-            .map(|n| (n, format!("{} · {n}", weight_name(n))))
-            .filter(|(n, title)| match typed {
-                Some(_) => n.to_string().starts_with(query),
+        let r = |x: f32| tenths(x.clamp(lo, hi));
+        let named: &[f32] = match p.axis {
+            Axis::Weight => &[100.0, 200.0, 300.0, 400.0, 500.0, 600.0, 700.0, 800.0, 900.0],
+            Axis::Width => &[50.0, 62.5, 75.0, 87.5, 100.0, 112.5, 125.0, 150.0, 200.0],
+        };
+        let mut vs: Vec<u32> = named.iter().filter(|n| (lo..=hi).contains(*n)).map(|n| tenths(*n)).collect();
+        vs.extend([r(lo), r(def), r(hi), r(p.current)]);
+        vs.extend(typed.filter(|t| (lo..=hi).contains(t)).map(r));
+        vs.sort();
+        vs.dedup();
+        vs.into_iter()
+            .map(|n| {
+                let v = n as f32 / 10.0;
+                (n, v.to_string(), format!("{} · {v}", axis_name(p.axis, v)))
+            })
+            .filter(|(_, v, title)| match typed {
+                Some(_) => v.starts_with(query),
                 None => crate::keys::fuzzy(query, title).is_some(),
             })
-            .map(|(n, title)| {
-                let chip = if n == r(w.current) { "in use" } else if n == r(def) { "font default" } else { "" };
-                (Action::SetWeight(w.style, n), title, chip.to_string())
+            .map(|(n, _, title)| {
+                let chip = if n == r(p.current) { "in use" } else if n == r(def) { "font default" } else { "" };
+                (Action::SetAxis(p.axis, p.style, n), title, chip.to_string())
             })
             .collect()
     }
@@ -1324,8 +1347,8 @@ impl State {
     /// only while they exist, with their directory.
     pub fn palette_items(&self) -> Vec<(Action, String, String)> {
         let query = self.palette.as_ref().map_or(String::new(), |p| p.edit.text.clone());
-        if let Some(w) = self.palette.as_ref().and_then(|p| p.weight.as_ref()) {
-            return State::weight_items(w, &query);
+        if let Some(pick) = self.palette.as_ref().and_then(|p| p.pick.as_ref()) {
+            return State::axis_items(pick, &query);
         }
         let mut rows: Vec<(i32, usize, Action, String)> = Action::all()
             .enumerate()
@@ -1371,12 +1394,12 @@ impl State {
                 return false;
             }
         }
-        let weights = p.weight.is_some();
+        let picking = p.pick.is_some();
         if let Some((a, ..)) = items.get(p.chosen) {
             tx.scroll_into_view_in("palette-list", format!("palette-{}", a.id()));
         }
-        if weights {
-            self.preview_weight();
+        if picking {
+            self.preview_axis();
         }
         true
     }
@@ -1976,27 +1999,37 @@ mod tests {
 
     #[test]
     fn the_weight_list_spans_the_axis_and_takes_a_typed_number() {
-        let w = WeightPick { style: 0, family: "X".into(), axis: Some((200.0, 400.0, 800.0)), current: 450.0, previewed: false };
-        let rows = State::weight_items(&w, "");
-        let ws: Vec<u16> = rows.iter().map(|r| match r.0 { Action::SetWeight(0, n) => n, _ => panic!() }).collect();
+        let w = AxisPick { axis: Axis::Weight, style: 0, family: "X".into(), range: Some((200.0, 400.0, 800.0)), current: 450.0, previewed: false };
+        let rows = State::axis_items(&w, "");
+        let ws: Vec<u32> = rows.iter().map(|r| match r.0 { Action::SetAxis(Axis::Weight, 0, n) => n / 10, _ => panic!() }).collect();
         assert_eq!(ws, [200, 300, 400, 450, 500, 600, 700, 800]);
         assert_eq!(rows[3].2, "in use");
         assert_eq!(rows[2].2, "font default");
         assert_eq!(rows[1].1, "Light · 300");
-        let typed: Vec<_> = State::weight_items(&w, "35").into_iter().map(|r| r.0).collect();
-        assert_eq!(typed, []);
-        let typed: Vec<_> = State::weight_items(&w, "350").into_iter().map(|r| r.0).collect();
-        assert_eq!(typed, [Action::SetWeight(0, 350)]);
-        assert_eq!(State::weight_items(&w, "900"), vec![]);
-        assert_eq!(State::weight_items(&w, "semi")[0].0, Action::SetWeight(0, 600));
-        let none = WeightPick { axis: None, ..w };
-        assert!(State::weight_items(&none, "").is_empty());
+        assert_eq!(State::axis_items(&w, "35"), vec![]);
+        let typed: Vec<_> = State::axis_items(&w, "350").into_iter().map(|r| r.0).collect();
+        assert_eq!(typed, [Action::SetAxis(Axis::Weight, 0, 3500)]);
+        assert_eq!(State::axis_items(&w, "900"), vec![]);
+        assert_eq!(State::axis_items(&w, "semi")[0].0, Action::SetAxis(Axis::Weight, 0, 6000));
+        let none = AxisPick { range: None, ..w };
+        assert!(State::axis_items(&none, "").is_empty());
+    }
+
+    #[test]
+    fn the_width_list_names_condensed_to_expanded() {
+        // Martian Mono's width axis.
+        let w = AxisPick { axis: Axis::Width, style: 0, family: "X".into(), range: Some((75.0, 112.5, 112.5)), current: 100.0, previewed: false };
+        let titles: Vec<String> = State::axis_items(&w, "").into_iter().map(|r| r.1).collect();
+        assert_eq!(titles, ["Condensed · 75", "SemiCondensed · 87.5", "Normal · 100", "SemiExpanded · 112.5"]);
+        assert_eq!(State::axis_items(&w, "")[2].2, "in use");
+        assert_eq!(State::axis_items(&w, "semic")[0].0, Action::SetAxis(Axis::Width, 0, 875));
+        assert_eq!(State::axis_items(&w, "90")[0].1, "Width · 90");
     }
 
     #[test]
     fn the_palette_filters_and_skips_missing_tabs() {
         let mut s = state_with(1);
-        s.palette = Some(Palette { edit: rune::TextEdit::new(""), chosen: 0, weight: None });
+        s.palette = Some(Palette { edit: rune::TextEdit::new(""), chosen: 0, pick: None });
         let all = s.palette_items();
         assert!(all.iter().any(|r| r.0 == Action::GotoTab(1)));
         assert!(!all.iter().any(|r| r.0 == Action::GotoTab(2)), "only tabs that exist");

@@ -1072,8 +1072,9 @@ fn palette(s: &State) -> El {
     let field = rune::text_input(&p.edit, TextStyle::new(15.0, 500.0))
         .key("palette-field")
         .single_line()
-        .placeholder(match p.weight.as_ref().map(|w| w.style) {
-            Some(0) => "Weight for regular text (or type one)…",
+        .placeholder(match p.pick.as_ref().map(|w| (w.axis, w.style)) {
+            Some((crate::keys::Axis::Width, _)) => "Width for all text (or type one)…",
+            Some((_, 0)) => "Weight for regular text (or type one)…",
             Some(_) => "Weight for bold text (or type one)…",
             None => "Type a command…",
         }, look::faint())
@@ -1115,9 +1116,9 @@ fn palette(s: &State) -> El {
         .child(el().h(1.0).w_full().fill(look::ink(0.06)).mb(6.0))
         .child(list)
         .child(row().h(30.0).px(16.0).gap(14.0).items_center().border_sides([1.0, 0.0, 0.0, 0.0], look::ink(0.05))
-            .child(text(if p.weight.is_some() { "↑↓ try · ↩ keep · esc put back" } else { "↑↓ choose · ↩ run · esc close" }).font(SMALL).color(look::faint()))
+            .child(text(if p.pick.is_some() { "↑↓ try · ↩ keep · esc put back" } else { "↑↓ choose · ↩ run · esc close" }).font(SMALL).color(look::faint()))
             .child(el().grow(1.0))
-            .child(text(if p.weight.is_some() { "saved as font-variation" } else { "keybind = CHORD=ACTION in the config" }).font(SMALL).color(look::faint())));
+            .child(text(if p.pick.is_some() { "saved as font-variation" } else { "keybind = CHORD=ACTION in the config" }).font(SMALL).color(look::faint())));
     el().key("palette-layer").pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0)).raise()
         .child(el().pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0)).fill(look::shade(0.25)).on_press(|s: &mut State| s.close_palette()))
         .child(row().w_full().justify_center().items_start().pt(90.0).child(panel))
@@ -1182,19 +1183,24 @@ pub fn spec() -> AppSpec<State> {
             ("readme-float", |s| showcase(s, true)),
             ("readme-palette", |s| {
                 showcase(s, false);
-                s.palette = Some(crate::state::Palette { edit: rune::TextEdit::new("split"), chosen: 0, weight: None });
+                s.palette = Some(crate::state::Palette { edit: rune::TextEdit::new("split"), chosen: 0, pick: None });
             }),
             ("picker", |s| s.toggle_picker()),
             ("palette", |s| {
-                s.palette = Some(crate::state::Palette { edit: rune::TextEdit::new(""), chosen: 2, weight: None });
+                s.palette = Some(crate::state::Palette { edit: rune::TextEdit::new(""), chosen: 2, pick: None });
             }),
             ("palette-weights", |s| {
                 // The weight list for a variable font's regular text, 450 in use.
-                let pick = crate::state::WeightPick { style: 0, family: "Geist Mono".into(), axis: Some((100.0, 400.0, 900.0)), current: 450.0, previewed: false };
-                s.palette = Some(crate::state::Palette { edit: rune::TextEdit::new(""), chosen: 4, weight: Some(pick) });
+                let pick = crate::state::AxisPick { axis: crate::keys::Axis::Weight, style: 0, family: "Geist Mono".into(), range: Some((100.0, 400.0, 900.0)), current: 450.0, previewed: false };
+                s.palette = Some(crate::state::Palette { edit: rune::TextEdit::new(""), chosen: 4, pick: Some(pick) });
+            }),
+            ("palette-widths", |s| {
+                // The width list for Martian Mono, SemiCondensed chosen.
+                let pick = crate::state::AxisPick { axis: crate::keys::Axis::Width, style: 0, family: "Martian Mono".into(), range: Some((75.0, 112.5, 112.5)), current: 100.0, previewed: false };
+                s.palette = Some(crate::state::Palette { edit: rune::TextEdit::new(""), chosen: 1, pick: Some(pick) });
             }),
             ("palette-filtered", |s| {
-                s.palette = Some(crate::state::Palette { edit: rune::TextEdit::new("flo"), chosen: 0, weight: None });
+                s.palette = Some(crate::state::Palette { edit: rune::TextEdit::new("flo"), chosen: 0, pick: None });
             }),
             ("pinned-float", |s| {
                 // A split floating and pinned, carried along to a second tab.

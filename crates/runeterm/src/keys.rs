@@ -41,14 +41,32 @@ pub enum Action {
     /// Pick the weight of a variable font's regular (or bold) text, from the palette.
     FontWeight,
     BoldFontWeight,
-    /// A row of that list: style (0 regular, 1 bold) and weight. Not in the config or the
-    /// main palette.
-    SetWeight(u8, u16),
+    /// Pick the width all styles share, from the palette.
+    FontWidth,
+    /// A row of those lists: the axis, the style (0 regular, 1 bold) and the value in tenths.
+    /// Not in the config or the main palette.
+    SetAxis(Axis, u8, u32),
     EditScrollback,
     ReloadConfig,
     Copy,
     Paste,
     CommandPalette,
+}
+
+/// A variable font axis the palette picks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Axis {
+    Weight,
+    Width,
+}
+
+impl Axis {
+    pub fn tag(self) -> &'static str {
+        match self {
+            Axis::Weight => "wght",
+            Axis::Width => "wdth",
+        }
+    }
 }
 
 /// Each action's name in the config and its title in the palette, in the palette's order.
@@ -94,6 +112,7 @@ const TABLE: &[(Action, &str, &str)] = &[
     (Action::ToggleSmoothCursor, "toggle-smooth-cursor", "Smooth cursor on or off"),
     (Action::FontWeight, "font-weight", "Font weight…"),
     (Action::BoldFontWeight, "bold-font-weight", "Bold font weight…"),
+    (Action::FontWidth, "font-width", "Font width (condensed, expanded)…"),
     (Action::EditScrollback, "edit-scrollback", "Open scrollback in editor"),
     (Action::ReloadConfig, "reload-config", "Reload config"),
     (Action::Copy, "copy", "Copy selection"),
@@ -158,7 +177,7 @@ impl Action {
     /// A key for the palette's row: the action's name, or its weight for a weight row.
     pub fn id(self) -> String {
         match self {
-            Action::SetWeight(style, w) => format!("weight-{style}-{w}"),
+            Action::SetAxis(axis, style, v) => format!("{}-{style}-{v}", axis.tag()),
             a => a.name().to_string(),
         }
     }

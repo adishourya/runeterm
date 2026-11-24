@@ -203,21 +203,50 @@ fn default_pattern(family: &str, i: usize) -> String {
     }
 }
 
-/// The `wght` axis of style `i`'s face (0 regular, 1 bold) as (min, default, max), or None
-/// when the face isn't variable in weight (or the style is off).
-pub fn weight_axis(spec: &FontSpec, i: usize) -> Option<(f32, f32, f32)> {
+/// Axis `name` (`wght`, `wdth`) of style `i`'s face (0 regular, 1 bold) as (min, default,
+/// max), from the family's variable file; None when it has no such axis (or the style is off).
+pub fn font_axis(spec: &FontSpec, i: usize, name: &str) -> Option<(f32, f32, f32)> {
     let pattern = font_pattern(spec, i)?;
     let path = variable_file(family_of(spec, i)).or_else(|| fc_match(&pattern, "%{file}"))?;
     let data = std::fs::read(path).ok()?;
     let font = FontRef::from_index(&data, 0)?;
-    let v = font.variations().find_by_tag(tag("wght"))?;
+    let v = font.variations().find_by_tag(tag(name))?;
     Some((v.min_value(), v.default_value(), v.max_value()))
 }
 
-/// `vs` (one style's `font-variation` axes) with `wght` set to `w`, other axes kept.
-pub fn with_weight(vs: &[(String, f32)], w: f32) -> Vec<(String, f32)> {
-    let mut out: Vec<(String, f32)> = vs.iter().filter(|(t, _)| t != "wght").cloned().collect();
-    out.insert(0, ("wght".into(), w));
+/// `vs` (one style's `font-variation` axes) with axis `name` set to `v`, other axes kept.
+pub fn with_axis(vs: &[(String, f32)], name: &str, v: f32) -> Vec<(String, f32)> {
+    let mut out = vs.to_vec();
+    match out.iter_mut().find(|(t, _)| t == name) {
+        Some(a) => a.1 = v,
+        None => out.push((name.into(), v)),
+    }
+    out
+}
+
+/// The width every style is drawn at, since they share the cells: regular's `wdth`, or the
+/// first style's that sets one.
+pub fn shared_width(vs: &[Vec<(String, f32)>; 4]) -> Option<f32> {
+    vs.iter().find_map(|s| s.iter().find(|(t, _)| t == "wdth").map(|(_, v)| *v))
+}
+
+/// Each style's axes as drawn: the shared width for all, and regular's other axes (a slant)
+/// added to the styles that don't set them. Weights stay each style's own.
+fn inherit_axes(vs: &[Vec<(String, f32)>; 4]) -> [Vec<(String, f32)>; 4] {
+    let width = shared_width(vs);
+    let mut out = vs.clone();
+    for (i, style) in out.iter_mut().enumerate() {
+        if i > 0 {
+            for (t, v) in vs[0].iter().filter(|(t, _)| t != "wght" && t != "wdth") {
+                if !style.iter().any(|(s, _)| s == t) {
+                    style.push((t.clone(), *v));
+                }
+            }
+        }
+        if let Some(w) = width {
+            *style = with_axis(style, "wdth", w);
+        }
+    }
     out
 }
 
@@ -302,21 +331,9 @@ impl Fonts {
         let mut data: [Option<Box<[u8]>>; 4] = Default::default();
         let mut synth = [(false, false); 4];
         let mut read: HashMap<String, usize> = HashMap::new();
+        let mut axes = inherit_axes(&spec.variations);
         for i in 0..4 {
             let Some(mut pattern) = font_pattern(spec, i) else { continue };
-            // A weight set for the style (`font-variation = wght=…`) needs the family's variable
-            // file, which fontconfig passes over for its static faces.
-            if spec.variations[i].iter().any(|(t, _)| t == "wght") {
-                if let Some(path) = variable_file(family_of(spec, i)) {
-                    if let Some(&j) = read.get(&path) {
-                        data[i] = data[j].clone();
-                    } else {
-                        data[i] = std::fs::read(&path).ok().map(Vec::into_boxed_slice);
-                        read.insert(path, i);
-                    }
-                    continue;
-                }
-            }
             // A named style the family doesn't have would get fontconfig's nearest face, which
             // can be anything: say so and use the family's own style instead.
             if let FontStyle::Named(want) = &spec.styles[i] {
@@ -325,6 +342,31 @@ impl Fonts {
                     let family = pattern.split(":style=").next().unwrap_or_default().to_string();
                     eprintln!("runeterm: no \"{want}\" style in {family}; using its default");
                     pattern = default_pattern(&family, i);
+                }
+            }
+            // Axes for the style need the family's variable file, which fontconfig passes over
+            // for its static faces: the style's own (`font-variation = wght=…`), or the width
+            // all styles share when the variable file has a width axis.
+            let own = !spec.variations[i].is_empty();
+            let width = axes[i].iter().any(|(t, _)| t == "wdth");
+            if let Some(path) = (own || width).then(|| variable_file(family_of(spec, i))).flatten() {
+                let vf = match read.get(&path) {
+                    Some(&j) => data[j].clone(),
+                    None => std::fs::read(&path).ok().map(Vec::into_boxed_slice),
+                };
+                let has = |t: &str| vf.as_deref().and_then(|d| FontRef::from_index(d, 0)).is_some_and(|f| f.variations().find_by_tag(tag(t)).is_some());
+                if own || has("wdth") {
+                    // With no weight of its own, the style keeps the one its static face has
+                    // (Light, the family's Bold) rather than the variable font's default.
+                    if !axes[i].iter().any(|(t, _)| t == "wght") && has("wght") {
+                        let face = read_font(&pattern).and_then(|(_, d)| FontRef::from_index(&d, 0).map(|f| f.attributes().weight().0));
+                        if let Some(w) = face {
+                            axes[i].insert(0, ("wght".into(), w as f32));
+                        }
+                    }
+                    data[i] = vf;
+                    read.entry(path).or_insert(i);
+                    continue;
                 }
             }
             // Faces that come out the same are read once.
@@ -339,24 +381,34 @@ impl Fonts {
         // fontconfig reports the weight it was asked for): a family with no bold (or italic)
         // face gets the nearest one, made bold (or slanted) when drawn, as Ghostty does.
         let attrs = |d: &Option<Box<[u8]>>| d.as_deref().and_then(|d| FontRef::from_index(d, 0)).map(|f| f.attributes());
-        let regular = attrs(&data[0]).map_or(400, |a| a.weight().0);
+        let wght = |i: usize| axes[i].iter().find(|(t, _)| t == "wght").map(|(_, v)| *v as u16);
+        let regular = wght(0).or(attrs(&data[0]).map(|a| a.weight().0)).unwrap_or(400);
         for i in 1..4 {
             let Some(a) = attrs(&data[i]) else { continue };
             if matches!(spec.styles[i], FontStyle::Default) && spec.synthetic[i - 1] {
                 let (bold, italic) = (i & 1 != 0, i & 2 != 0);
-                // A bold given its own weight (`font-variation-bold = wght=…`) is drawn at it.
-                let weighted = spec.variations[i].iter().any(|(t, _)| t == "wght");
-                synth[i] = (bold && !weighted && a.weight().0 <= regular, italic && a.style() == swash::Style::Normal);
+                // A bold drawn at a weight of its own (`font-variation-bold = wght=…`) is drawn
+                // at it, made up only if that isn't heavier.
+                let weight = wght(i).unwrap_or(a.weight().0);
+                synth[i] = (bold && weight <= regular, italic && a.style() == swash::Style::Normal);
             }
         }
         let features = spec.features.iter().map(|(t, v)| swash::Setting { tag: tag(t), value: *v }).collect();
-        let variations = spec.variations.clone().map(|vs| vs.iter().map(|(t, v)| swash::Setting { tag: tag(t), value: *v }).collect());
+        let variations = axes.map(|vs| vs.iter().map(|(t, v)| swash::Setting { tag: tag(t), value: *v }).collect());
         Fonts { data, synth, features, variations, extra: vec![], paths: HashMap::new(), by_char: HashMap::new(), resolved: HashMap::new() }
     }
 
     /// The variable font axes for font `i` (styles only; fallbacks keep their defaults).
     fn variations(&self, i: usize) -> &[swash::Setting<f32>] {
         self.variations.get(i).map_or(&[], |v| v.as_slice())
+    }
+
+    /// Style `i`'s axes as normalized coordinates, for measuring it as it's drawn.
+    fn coords(&self, i: usize) -> Vec<swash::NormalizedCoord> {
+        match self.get(i) {
+            Some(font) => font.variations().normalized_coords(self.variations(i).iter().copied()).collect(),
+            None => vec![],
+        }
     }
 
     fn get(&self, style: usize) -> Option<FontRef<'_>> {
@@ -1062,7 +1114,7 @@ impl GridRenderer {
     fn natural(&self, px: f32) -> f32 {
         match self.fonts.get(0) {
             Some(font) => {
-                let m = font.metrics(&[]).scale(px);
+                let m = font.metrics(&self.fonts.coords(0)).scale(px);
                 m.ascent + m.descent + m.leading
             }
             None => px * 1.3,
@@ -1085,9 +1137,11 @@ impl GridRenderer {
         let Some(font) = self.fonts.get(0) else {
             return Metrics { w: (px * 0.6).round(), h, baseline: px, px };
         };
-        let m = font.metrics(&[]).scale(px);
+        // Measured with the regular style's axes: a narrower width (wdth) makes narrower cells.
+        let coords = self.fonts.coords(0);
+        let m = font.metrics(&coords).scale(px);
         let gid = font.charmap().map('M');
-        let w = font.glyph_metrics(&[]).scale(px).advance_width(gid).round().max(1.0);
+        let w = font.glyph_metrics(&coords).scale(px).advance_width(gid).round().max(1.0);
         let baseline = ((h - (m.ascent + m.descent)) / 2.0 + m.ascent).round();
         Metrics { w, h, baseline, px }
     }
@@ -1876,7 +1930,15 @@ mod tests {
         assert_eq!(parse_variations("wght=450, slnt=-10"), Some(vec![("wght".into(), 450.0), ("slnt".into(), -10.0)]));
         assert_eq!(parse_variations("wght"), None);
         let vs = vec![("slnt".to_string(), -10.0), ("wght".to_string(), 450.0)];
-        assert_eq!(with_weight(&vs, 300.0), vec![("wght".into(), 300.0), ("slnt".into(), -10.0)]);
+        let inherited = inherit_axes(&[vec![("wght".into(), 300.0), ("wdth".into(), 87.5), ("slnt".into(), -5.0)], vec![("wght".into(), 600.0)], vec![("wdth".into(), 100.0)], vec![]]);
+        assert_eq!(inherited[1], vec![("wght".into(), 600.0), ("slnt".into(), -5.0), ("wdth".into(), 87.5)], "bold keeps its weight, takes the width");
+        assert_eq!(inherited[2], vec![("wdth".into(), 87.5), ("slnt".into(), -5.0)], "regular's width is every style's");
+        assert_eq!(inherited[3], vec![("slnt".into(), -5.0), ("wdth".into(), 87.5)]);
+        // A width set on one style alone is every style's too.
+        let only_bold = inherit_axes(&[vec![], vec![("wdth".into(), 75.0)], vec![], vec![]]);
+        assert!(only_bold.iter().all(|s| s == &vec![("wdth".to_string(), 75.0)]));
+        assert_eq!(with_axis(&vs, "wght", 300.0), vec![("slnt".into(), -10.0), ("wght".into(), 300.0)]);
+        assert_eq!(with_axis(&vs, "wdth", 87.5)[2], ("wdth".into(), 87.5));
         assert_eq!(parse_synthetic("false"), [false; 3]);
         assert_eq!(parse_synthetic("no-bold,no-bold-italic"), [false, true, false]);
         assert_eq!(parse_synthetic("true"), [true; 3]);
@@ -1929,7 +1991,7 @@ mod tests {
         assert!(file.contains("Geist"));
         let mut c = Config::default();
         c.apply("font-family = Geist Mono\n", std::path::Path::new("/"));
-        let (lo, _, hi) = weight_axis(&c.font, 0).expect("Geist Mono's variable file has a wght axis");
+        let (lo, _, hi) = font_axis(&c.font, 0, "wght").expect("Geist Mono's variable file has a wght axis");
         assert!(lo <= 300.0 && hi >= 700.0, "{lo}..{hi}");
         // The weight is drawn: heavier text has more ink.
         let ink = |w: &str| {
@@ -1944,6 +2006,39 @@ mod tests {
             img.data.iter().map(|&a| a as u32).sum::<u32>()
         };
         assert!(ink("200") < ink("800"));
+    }
+
+    /// A narrower width (`wdth`) narrows the cells too, not just the letters, and loads the
+    /// variable file without a weight set.
+    #[test]
+    fn a_width_narrows_the_cells() {
+        if variable_file("Martian Mono").is_none() {
+            return;
+        }
+        let cell_w = |extra: &str| {
+            let mut c = Config::default();
+            c.apply(&format!("font-family = Martian Mono\n{extra}"), std::path::Path::new("/"));
+            let mut g = GridRenderer::new(&c);
+            let font = g.fonts.get(0).unwrap();
+            let axis = font.variations().find_by_tag(tag("wdth")).map(|v| (v.min_value(), v.default_value(), v.max_value()));
+            eprintln!("wdth axis {axis:?}");
+            g.metrics_at(1.0).w
+        };
+        let normal = cell_w("font-variation = wdth=100\n");
+        let condensed = cell_w("font-variation = wdth=75\n");
+        eprintln!("cell width: wdth=100 {normal}, wdth=75 {condensed}");
+        assert!(condensed < normal);
+        // Set on bold alone, the width is regular's too; regular's Light face keeps its weight
+        // in the variable file, and the family's Bold its own.
+        let mut c = Config::default();
+        c.apply("font-family = Martian Mono\nfont-style = Light\nfont-variation-bold = wdth=75\n", std::path::Path::new("/"));
+        let mut g = GridRenderer::new(&c);
+        assert_eq!(g.metrics_at(1.0).w, condensed);
+        let axis = |i: usize, t: &str| g.fonts.variations(i).iter().find(|s| s.tag == tag(t)).map(|s| s.value);
+        assert_eq!(axis(0, "wght"), Some(300.0));
+        assert_eq!(axis(1, "wght"), Some(700.0));
+        assert_eq!(axis(0, "wdth"), Some(75.0));
+        assert!(!g.fonts.synth[1].0, "a real bold weight isn't emboldened too");
     }
 
     #[test]
