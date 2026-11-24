@@ -2860,6 +2860,7 @@ dependencies = [
  "rune",
  "serde",
  "serde_json",
+ "skrifa",
  "swash",
  "wgpu",
 ]

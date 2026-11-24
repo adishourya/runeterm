@@ -11,6 +11,8 @@ portable-pty = "0.9"
 libc = "0.2"
 wgpu = { version = "~30.0.1", default-features = false, features = ["std", "wgsl", "glsl"] }
 swash = "0.2.10"
+# Advances of variable fonts with no HVAR table (from their outlines), which swash skips.
+skrifa = "0.44"
 bytemuck = { version = "1", features = ["derive"] }
 png = "0.18"
 serde = { version = "1", features = ["derive"] }

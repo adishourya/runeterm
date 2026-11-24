@@ -194,6 +194,34 @@ fn variable_file(family: &str) -> Option<String> {
     (variable == "True" && readable && has_style(families, family)).then(|| file.to_string())
 }
 
+/// `ch`'s advance at `px` with axes set, for a variable font with no HVAR table: swash then
+/// gives the default instance's advance, but the width axis still changes it (through the
+/// outline's phantom points), so the cells would stay wide while the letters narrow. Martian
+/// Mono 1.1.0 is such a font. None when swash's own answer is right.
+fn varied_advance(data: &[u8], ch: char, axes: &[swash::Setting<f32>], px: f32) -> Option<f32> {
+    use skrifa::raw::TableProvider;
+    use skrifa::MetadataProvider;
+    struct NoPen;
+    impl skrifa::outline::OutlinePen for NoPen {
+        fn move_to(&mut self, _: f32, _: f32) {}
+        fn line_to(&mut self, _: f32, _: f32) {}
+        fn quad_to(&mut self, _: f32, _: f32, _: f32, _: f32) {}
+        fn curve_to(&mut self, _: f32, _: f32, _: f32, _: f32, _: f32, _: f32) {}
+        fn close(&mut self) {}
+    }
+    if axes.is_empty() {
+        return None;
+    }
+    let font = skrifa::FontRef::new(data).ok()?;
+    if font.hvar().is_ok() {
+        return None;
+    }
+    let location = font.axes().location(axes.iter().map(|s| (skrifa::Tag::from_u32(s.tag), s.value)));
+    let glyph = font.outline_glyphs().get(font.charmap().map(ch)?)?;
+    let settings = skrifa::outline::DrawSettings::unhinted(skrifa::instance::Size::new(px), &location);
+    glyph.draw(settings, &mut NoPen).ok()?.advance_width
+}
+
 fn default_pattern(family: &str, i: usize) -> String {
     match i {
         1 => format!("{family}:bold"),
@@ -1141,7 +1169,10 @@ impl GridRenderer {
         let coords = self.fonts.coords(0);
         let m = font.metrics(&coords).scale(px);
         let gid = font.charmap().map('M');
-        let w = font.glyph_metrics(&coords).scale(px).advance_width(gid).round().max(1.0);
+        let w = varied_advance(font.data, 'M', self.fonts.variations(0), px)
+            .unwrap_or_else(|| font.glyph_metrics(&coords).scale(px).advance_width(gid))
+            .round()
+            .max(1.0);
         let baseline = ((h - (m.ascent + m.descent)) / 2.0 + m.ascent).round();
         Metrics { w, h, baseline, px }
     }
@@ -2039,6 +2070,22 @@ mod tests {
         assert_eq!(axis(1, "wght"), Some(700.0));
         assert_eq!(axis(0, "wdth"), Some(75.0));
         assert!(!g.fonts.synth[1].0, "a real bold weight isn't emboldened too");
+    }
+
+    /// A variable font with no HVAR table (Martian Mono 1.1.0) narrows its cells with its width.
+    #[test]
+    fn a_width_narrows_the_cells_without_hvar() {
+        if variable_file("Martian Mono VF").is_none() {
+            return;
+        }
+        let cell_w = |extra: &str| {
+            let mut c = Config::default();
+            c.apply(&format!("font-family = Martian Mono VF\n{extra}"), std::path::Path::new("/"));
+            GridRenderer::new(&c).metrics_at(1.0).w
+        };
+        let (wide, normal, condensed) = (cell_w("font-variation = wdth=112.5\n"), cell_w("font-variation = wdth=100\n"), cell_w("font-variation = wdth=75\n"));
+        eprintln!("cell width: wdth=112.5 {wide}, 100 {normal}, 75 {condensed}");
+        assert!(condensed < normal && normal < wide);
     }
 
     #[test]
