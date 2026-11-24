@@ -737,9 +737,16 @@ fn sidebar(s: &State) -> El {
     if !pinned {
         bar = bar.on_hover_change(|s: &mut State, hovered, _| s.sidebar_open = hovered);
     }
+    // `sidebar-background` / `light-sidebar-background`: one colour for the rail, the pinned
+    // sidebar and the open one, edged with a hairline where it meets the splits.
+    let own = if s.light { s.sidebar.light_background } else { s.sidebar.background };
+    if let Some(c) = own {
+        bar = bar.fill(rgb_color(c)).border_sides([0.0, 1.0, 0.0, 0.0], look::ink(0.05));
+    } else if open && !pinned {
+        bar = bar.fill(look::surface(0)).border_sides([0.0, 1.0, 0.0, 0.0], look::ink(0.05));
+    }
     if open && !pinned {
-        bar = bar.fill(look::surface(0)).border_sides([0.0, 1.0, 0.0, 0.0], look::ink(0.05))
-            .shadow(0.0, 48.0, look::shade(0.6));
+        bar = bar.shadow(0.0, 48.0, look::shade(0.6));
     }
     bar
 }

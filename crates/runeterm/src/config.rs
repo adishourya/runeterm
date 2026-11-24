@@ -56,11 +56,16 @@ pub struct Sidebar {
     pub battery: bool,
     /// `sidebar-host`: `user@host` under the session's name.
     pub host: bool,
+    /// `sidebar-background`, `light-sidebar-background`: the sidebar's colour (rail, pinned and
+    /// open alike) in dark and light mode. None keeps the default: the window shows through a
+    /// pinned sidebar or the rail, and an open one is a raised surface.
+    pub background: Option<Rgb>,
+    pub light_background: Option<Rgb>,
 }
 
 impl Default for Sidebar {
     fn default() -> Self {
-        Sidebar { pinned: false, width: 300.0, rail: 76.0, clock: true, battery: true, host: true }
+        Sidebar { pinned: false, width: 300.0, rail: 76.0, clock: true, battery: true, host: true, background: None, light_background: None }
     }
 }
 
@@ -266,6 +271,9 @@ impl Config {
              sidebar-battery = {}\n\
              # user@host under the session's name.\n\
              sidebar-host = {}\n\
+             # Its colour in dark and light mode (rail, pinned and open alike); unset, the\n\
+             # window shows through.\n\
+             {sidebar_colors}\
              \n\
              # --- Appearance ---\n\
              # dark or light. The light terminal colours are light-background,\n\
@@ -302,6 +310,13 @@ impl Config {
             self.sidebar.clock,
             self.sidebar.battery,
             self.sidebar.host,
+            sidebar_colors = [("sidebar-background", self.sidebar.background), ("light-sidebar-background", self.sidebar.light_background)]
+                .iter()
+                .map(|(k, c)| match c {
+                    Some(c) => format!("{k} = {}\n", hex(*c)),
+                    None => format!("# {k} = \n"),
+                })
+                .collect::<String>(),
             editor = self.scrollback_editor,
             keybinds = keybind_section(),
             synthetic = match f.synthetic {
@@ -428,6 +443,9 @@ impl Config {
                 "sidebar-clock" => self.sidebar.clock = v != "false",
                 "sidebar-battery" => self.sidebar.battery = v != "false",
                 "sidebar-host" => self.sidebar.host = v != "false",
+                // Empty clears it (back to the default look).
+                "sidebar-background" => self.sidebar.background = if v.is_empty() { None } else { rgb(v).or(self.sidebar.background) },
+                "light-sidebar-background" => self.sidebar.light_background = if v.is_empty() { None } else { rgb(v).or(self.sidebar.light_background) },
                 "scrollback-editor" if !v.is_empty() => self.scrollback_editor = v.to_string(),
                 "theme" => self.light = v == "light",
                 "copy-on-select" => self.copy_on_select = matches!(v, "true" | "clipboard"),
@@ -556,7 +574,17 @@ mod tests {
     #[test]
     fn reads_sidebar_settings() {
         let mut c = Config::default();
-        c.apply("sidebar = pinned\nsidebar-width = 340\nsidebar-rail-width = 9000\nsidebar-battery = false\n", Path::new("/"));
+        c.apply("sidebar = pinned\nsidebar-width = 340\nsidebar-rail-width = 9000\nsidebar-battery = false\nsidebar-background = #1a1b26\nlight-sidebar-background = #eceff4\n", Path::new("/"));
+        assert_eq!(c.sidebar.background, Some(Rgb(0x1a, 0x1b, 0x26)));
+        assert_eq!(c.sidebar.light_background, Some(Rgb(0xec, 0xef, 0xf4)));
+        let back = {
+            let mut b = Config::default();
+            b.apply(&c.render(&[]), Path::new("/"));
+            b
+        };
+        assert_eq!(back.sidebar, c.sidebar, "a written config keeps the colours");
+        c.apply("sidebar-background =\n", Path::new("/"));
+        assert_eq!(c.sidebar.background, None, "empty goes back to the default");
         assert!(c.sidebar.pinned);
         assert_eq!(c.sidebar.width, 340.0);
         assert_eq!(c.sidebar.rail, 140.0, "clamped");

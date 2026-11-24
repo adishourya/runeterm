@@ -124,7 +124,8 @@ reloads it. Beyond Ghostty's colours, cursor and shaders:
   Dividers snap to whole lines and columns once you let go of them, so a split never ends in a
   part of a line.
 - **Sidebar.** `sidebar = pinned` or `hover`, its widths, and whether it shows the time, the
-  battery and `user@host`.
+  battery and `user@host`. `sidebar-background` and `light-sidebar-background` colour it (the
+  rail, pinned and open alike) in dark and light mode; unset, the window shows through.
 - **Appearance.** `theme = dark` or `light`, `accent`, and `accent-colors` for the swatches.
   Each session's accent is picked so no two sessions share one.
 
