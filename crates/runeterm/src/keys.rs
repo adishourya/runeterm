@@ -38,6 +38,12 @@ pub enum Action {
     ToggleSidebar,
     ToggleTheme,
     ToggleSmoothCursor,
+    /// Pick the weight of a variable font's regular (or bold) text, from the palette.
+    FontWeight,
+    BoldFontWeight,
+    /// A row of that list: style (0 regular, 1 bold) and weight. Not in the config or the
+    /// main palette.
+    SetWeight(u8, u16),
     EditScrollback,
     ReloadConfig,
     Copy,
@@ -86,6 +92,8 @@ const TABLE: &[(Action, &str, &str)] = &[
     (Action::ToggleSidebar, "toggle-sidebar", "Pin or unpin the sidebar"),
     (Action::ToggleTheme, "toggle-theme", "Light or dark mode"),
     (Action::ToggleSmoothCursor, "toggle-smooth-cursor", "Smooth cursor on or off"),
+    (Action::FontWeight, "font-weight", "Font weight…"),
+    (Action::BoldFontWeight, "bold-font-weight", "Bold font weight…"),
     (Action::EditScrollback, "edit-scrollback", "Open scrollback in editor"),
     (Action::ReloadConfig, "reload-config", "Reload config"),
     (Action::Copy, "copy", "Copy selection"),
@@ -145,6 +153,14 @@ impl Action {
 
     pub fn title(self) -> &'static str {
         TABLE.iter().find(|r| r.0 == self).map_or("", |r| r.2)
+    }
+
+    /// A key for the palette's row: the action's name, or its weight for a weight row.
+    pub fn id(self) -> String {
+        match self {
+            Action::SetWeight(style, w) => format!("weight-{style}-{w}"),
+            a => a.name().to_string(),
+        }
     }
 
     pub fn named(name: &str) -> Option<Action> {

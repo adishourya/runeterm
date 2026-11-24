@@ -117,7 +117,10 @@ reloads it. Beyond Ghostty's colours, cursor and shaders:
   for the regular face) and `font-family-bold`, `-italic` and `-bold-italic`.
   `font-feature = -calt, -liga` turns ligatures off, and `ss01` turns a stylistic set on.
   `font-variation` (and `-bold`, `-italic`, `-bold-italic`) sets a variable font's axes
-  (`wght=450`). A family with no bold or italic face gets a made-up one, emboldened or slanted;
+  (`wght=450`). The palette's "Font weight…" and "Bold font weight…" list the font's weights
+  and show each in the terminals as you arrow through them; Enter saves it as `font-variation`
+  (or `-bold`), Esc puts the old one back. A weight uses the family's variable file even when
+  fontconfig would pick a static face. A family with no bold or italic face gets a made-up one, emboldened or slanted;
   `font-synthetic-style = false` (or `no-bold`, `no-italic`, `no-bold-italic`) turns that off.
 - **Fit.** `font-size-fit = 3%` lets the line height (and, if that's not enough, the font size)
   move by up to that much, so the lines fill the splits with no blank strip under the last one.

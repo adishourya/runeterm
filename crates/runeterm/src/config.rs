@@ -228,7 +228,7 @@ impl Config {
              font-synthetic-style = {synthetic}\n\
              # OpenType features: -calt -liga turn ligatures off, ss01 turns a set on.\n\
              {features}\
-             # Axes of a variable font, per style: wght=450.\n\
+             # Axes of a variable font, per style: wght=450 (or pick one: ⌥P, Font weight).\n\
              {variations}\
              # In points, as in Ghostty.\n\
              font-size = {}\n\
@@ -515,6 +515,29 @@ pub fn set(key: &str, value: &str) -> std::io::Result<()> {
             }
         })
         .collect();
+    if !done {
+        out.push(format!("{key} = {value}"));
+    }
+    std::fs::write(&path, out.join("\n") + "\n")
+}
+
+/// Like `set`, but for a key that may repeat (`font-variation`): the first uncommented line
+/// gets the value and the others with that key are dropped, so it's the only one.
+pub fn replace(key: &str, value: &str) -> std::io::Result<()> {
+    let path = path();
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut done = false;
+    let mut out: Vec<String> = vec![];
+    for l in text.lines() {
+        let t = l.trim_start();
+        let is_key = !t.starts_with('#') && t.split_once('=').is_some_and(|(k, _)| k.trim() == key);
+        if !is_key {
+            out.push(l.to_string());
+        } else if !done {
+            done = true;
+            out.push(format!("{key} = {value}"));
+        }
+    }
     if !done {
         out.push(format!("{key} = {value}"));
     }

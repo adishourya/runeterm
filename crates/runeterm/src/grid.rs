@@ -178,6 +178,22 @@ pub fn font_pattern(spec: &FontSpec, i: usize) -> Option<String> {
     }
 }
 
+/// The family face `i` is drawn from: the style's own or `font-family`.
+fn family_of(spec: &FontSpec, i: usize) -> &str {
+    i.checked_sub(1).and_then(|j| spec.families[j].as_deref()).unwrap_or(&spec.family)
+}
+
+/// The variable font file of `family`, if one is installed. Fontconfig prefers a family's
+/// static faces, and with `variable=true` gives some variable font even of another family, so
+/// its answer is kept only when it's this family (and a format swash reads).
+fn variable_file(family: &str) -> Option<String> {
+    let out = fc_match(&format!("{family}:variable=true"), "%{variable}\t%{file}\t%{family}")?;
+    let mut parts = out.splitn(3, '\t');
+    let (variable, file, families) = (parts.next()?, parts.next()?, parts.next()?);
+    let readable = !file.ends_with(".woff") && !file.ends_with(".woff2");
+    (variable == "True" && readable && has_style(families, family)).then(|| file.to_string())
+}
+
 fn default_pattern(family: &str, i: usize) -> String {
     match i {
         1 => format!("{family}:bold"),
@@ -185,6 +201,24 @@ fn default_pattern(family: &str, i: usize) -> String {
         3 => format!("{family}:bold:italic"),
         _ => family.to_string(),
     }
+}
+
+/// The `wght` axis of style `i`'s face (0 regular, 1 bold) as (min, default, max), or None
+/// when the face isn't variable in weight (or the style is off).
+pub fn weight_axis(spec: &FontSpec, i: usize) -> Option<(f32, f32, f32)> {
+    let pattern = font_pattern(spec, i)?;
+    let path = variable_file(family_of(spec, i)).or_else(|| fc_match(&pattern, "%{file}"))?;
+    let data = std::fs::read(path).ok()?;
+    let font = FontRef::from_index(&data, 0)?;
+    let v = font.variations().find_by_tag(tag("wght"))?;
+    Some((v.min_value(), v.default_value(), v.max_value()))
+}
+
+/// `vs` (one style's `font-variation` axes) with `wght` set to `w`, other axes kept.
+pub fn with_weight(vs: &[(String, f32)], w: f32) -> Vec<(String, f32)> {
+    let mut out: Vec<(String, f32)> = vs.iter().filter(|(t, _)| t != "wght").cloned().collect();
+    out.insert(0, ("wght".into(), w));
+    out
 }
 
 /// The cell size that fills a grid `target` device pixels tall best: a font size (px) and a
@@ -270,6 +304,19 @@ impl Fonts {
         let mut read: HashMap<String, usize> = HashMap::new();
         for i in 0..4 {
             let Some(mut pattern) = font_pattern(spec, i) else { continue };
+            // A weight set for the style (`font-variation = wght=…`) needs the family's variable
+            // file, which fontconfig passes over for its static faces.
+            if spec.variations[i].iter().any(|(t, _)| t == "wght") {
+                if let Some(path) = variable_file(family_of(spec, i)) {
+                    if let Some(&j) = read.get(&path) {
+                        data[i] = data[j].clone();
+                    } else {
+                        data[i] = std::fs::read(&path).ok().map(Vec::into_boxed_slice);
+                        read.insert(path, i);
+                    }
+                    continue;
+                }
+            }
             // A named style the family doesn't have would get fontconfig's nearest face, which
             // can be anything: say so and use the family's own style instead.
             if let FontStyle::Named(want) = &spec.styles[i] {
@@ -297,7 +344,9 @@ impl Fonts {
             let Some(a) = attrs(&data[i]) else { continue };
             if matches!(spec.styles[i], FontStyle::Default) && spec.synthetic[i - 1] {
                 let (bold, italic) = (i & 1 != 0, i & 2 != 0);
-                synth[i] = (bold && a.weight().0 <= regular, italic && a.style() == swash::Style::Normal);
+                // A bold given its own weight (`font-variation-bold = wght=…`) is drawn at it.
+                let weighted = spec.variations[i].iter().any(|(t, _)| t == "wght");
+                synth[i] = (bold && !weighted && a.weight().0 <= regular, italic && a.style() == swash::Style::Normal);
             }
         }
         let features = spec.features.iter().map(|(t, v)| swash::Setting { tag: tag(t), value: *v }).collect();
@@ -1826,6 +1875,8 @@ mod tests {
         assert_eq!(parse_features("toolong"), None);
         assert_eq!(parse_variations("wght=450, slnt=-10"), Some(vec![("wght".into(), 450.0), ("slnt".into(), -10.0)]));
         assert_eq!(parse_variations("wght"), None);
+        let vs = vec![("slnt".to_string(), -10.0), ("wght".to_string(), 450.0)];
+        assert_eq!(with_weight(&vs, 300.0), vec![("wght".into(), 300.0), ("slnt".into(), -10.0)]);
         assert_eq!(parse_synthetic("false"), [false; 3]);
         assert_eq!(parse_synthetic("no-bold,no-bold-italic"), [false, true, false]);
         assert_eq!(parse_synthetic("true"), [true; 3]);
@@ -1867,6 +1918,32 @@ mod tests {
             g.shape_row(&m, &cells("x"))
         };
         assert_eq!(lone, vec![Draw::Char]);
+    }
+
+    /// A family with static and variable files (Geist Mono) gets its variable one for a weight;
+    /// one that has none isn't swapped for another family's.
+    #[test]
+    fn a_weight_finds_the_familys_variable_file() {
+        assert_eq!(variable_file("NoSuchFamilyAtAll"), None);
+        let Some(file) = variable_file("Geist Mono") else { return };
+        assert!(file.contains("Geist"));
+        let mut c = Config::default();
+        c.apply("font-family = Geist Mono\n", std::path::Path::new("/"));
+        let (lo, _, hi) = weight_axis(&c.font, 0).expect("Geist Mono's variable file has a wght axis");
+        assert!(lo <= 300.0 && hi >= 700.0, "{lo}..{hi}");
+        // The weight is drawn: heavier text has more ink.
+        let ink = |w: &str| {
+            let mut c = Config::default();
+            c.apply(&format!("font-family = Geist Mono\nfont-variation = wght={w}\n"), std::path::Path::new("/"));
+            let mut g = GridRenderer::new(&c);
+            let m = g.metrics_at(1.0);
+            let (fi, gid) = g.fonts.resolve('M', 0).unwrap();
+            let font = g.fonts.get(fi).unwrap();
+            let mut scaler = g.ctx.builder(font).size(m.px).variations(g.fonts.variations(fi).iter().copied()).build();
+            let img = swash::scale::Render::new(&[swash::scale::Source::Outline]).render(&mut scaler, gid).unwrap();
+            img.data.iter().map(|&a| a as u32).sum::<u32>()
+        };
+        assert!(ink("200") < ink("800"));
     }
 
     #[test]

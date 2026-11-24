@@ -1072,7 +1072,11 @@ fn palette(s: &State) -> El {
     let field = rune::text_input(&p.edit, TextStyle::new(15.0, 500.0))
         .key("palette-field")
         .single_line()
-        .placeholder("Type a command…", look::faint())
+        .placeholder(match p.weight.as_ref().map(|w| w.style) {
+            Some(0) => "Weight for regular text (or type one)…",
+            Some(_) => "Weight for bold text (or type one)…",
+            None => "Type a command…",
+        }, look::faint())
         .caret(look::accent(), look::accent().alpha(0.3))
         .color(look::text())
         .on_edit(|s: &mut State| &mut s.palette.as_mut().expect("palette open").edit)
@@ -1083,11 +1087,11 @@ fn palette(s: &State) -> El {
         .child(el().grow(1.0).min_w(0.0).child(field));
     let mut list = col().key("palette-list").w_full().gap(1.0).px(6.0).pb(6.0).max_h(420.0).scroll(rune::ScrollSpec { stick_bottom: false });
     if items.is_empty() {
-        list = list.child(text("No matching command").font(BODY).color(look::faint()).px(10.0).py(12.0));
+        list = list.child(text(s.palette_empty()).font(BODY).color(look::faint()).px(10.0).py(12.0));
     }
     for (i, (action, title, keys)) in items.into_iter().enumerate() {
         let on = i == chosen;
-        let mut r = row().key(format!("palette-{}", action.name())).h(36.0).w_full().px(10.0).gap(10.0).items_center().radius(9.0)
+        let mut r = row().key(format!("palette-{}", action.id())).h(36.0).w_full().px(10.0).gap(10.0).items_center().radius(9.0)
             .hover(look::ink(0.05)).cursor(Cursor::Pointer)
             .on_press_tx(move |s: &mut State, tx: &mut Tx| s.run_chosen_at(i, tx))
             .child(text(title).font(TextStyle::new(13.0, if on { 600.0 } else { 480.0 })).color(if on { look::text() } else { look::dim() })
@@ -1111,11 +1115,11 @@ fn palette(s: &State) -> El {
         .child(el().h(1.0).w_full().fill(look::ink(0.06)).mb(6.0))
         .child(list)
         .child(row().h(30.0).px(16.0).gap(14.0).items_center().border_sides([1.0, 0.0, 0.0, 0.0], look::ink(0.05))
-            .child(text("↑↓ choose · ↩ run · esc close").font(SMALL).color(look::faint()))
+            .child(text(if p.weight.is_some() { "↑↓ try · ↩ keep · esc put back" } else { "↑↓ choose · ↩ run · esc close" }).font(SMALL).color(look::faint()))
             .child(el().grow(1.0))
-            .child(text("keybind = CHORD=ACTION in the config").font(SMALL).color(look::faint())));
+            .child(text(if p.weight.is_some() { "saved as font-variation" } else { "keybind = CHORD=ACTION in the config" }).font(SMALL).color(look::faint())));
     el().key("palette-layer").pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0)).raise()
-        .child(el().pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0)).fill(look::shade(0.25)).on_press(|s: &mut State| s.palette = None))
+        .child(el().pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0)).fill(look::shade(0.25)).on_press(|s: &mut State| s.close_palette()))
         .child(row().w_full().justify_center().items_start().pt(90.0).child(panel))
 }
 
@@ -1178,14 +1182,19 @@ pub fn spec() -> AppSpec<State> {
             ("readme-float", |s| showcase(s, true)),
             ("readme-palette", |s| {
                 showcase(s, false);
-                s.palette = Some(crate::state::Palette { edit: rune::TextEdit::new("split"), chosen: 0 });
+                s.palette = Some(crate::state::Palette { edit: rune::TextEdit::new("split"), chosen: 0, weight: None });
             }),
             ("picker", |s| s.toggle_picker()),
             ("palette", |s| {
-                s.palette = Some(crate::state::Palette { edit: rune::TextEdit::new(""), chosen: 2 });
+                s.palette = Some(crate::state::Palette { edit: rune::TextEdit::new(""), chosen: 2, weight: None });
+            }),
+            ("palette-weights", |s| {
+                // The weight list for a variable font's regular text, 450 in use.
+                let pick = crate::state::WeightPick { style: 0, family: "Geist Mono".into(), axis: Some((100.0, 400.0, 900.0)), current: 450.0, previewed: false };
+                s.palette = Some(crate::state::Palette { edit: rune::TextEdit::new(""), chosen: 4, weight: Some(pick) });
             }),
             ("palette-filtered", |s| {
-                s.palette = Some(crate::state::Palette { edit: rune::TextEdit::new("flo"), chosen: 0 });
+                s.palette = Some(crate::state::Palette { edit: rune::TextEdit::new("flo"), chosen: 0, weight: None });
             }),
             ("pinned-float", |s| {
                 // A split floating and pinned, carried along to a second tab.
