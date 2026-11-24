@@ -942,6 +942,14 @@ impl State {
         self.reload_config();
     }
 
+    /// Turns the cursor glide on or off, and saves it as `smooth-cursor` so it sticks.
+    pub fn set_smooth_cursor(&mut self, on: bool) {
+        if let Err(e) = crate::config::set("smooth-cursor", if on { "true" } else { "false" }) {
+            eprintln!("runeterm: can't save smooth-cursor: {e}");
+        }
+        self.reload_config();
+    }
+
     pub fn set_accent(&mut self, c: crate::vt::Rgb) {
         if let Some(s) = &self.session {
             // In a session the swatches colour the session; the config's accent is for windows
@@ -1172,6 +1180,7 @@ impl State {
             }
             Action::ToggleSidebar => self.toggle_sidebar(),
             Action::ToggleTheme => self.set_light(!self.light),
+            Action::ToggleSmoothCursor => self.set_smooth_cursor(!Config::load().cursor_smooth),
             Action::EditScrollback => self.edit_scrollback(),
             Action::ReloadConfig => self.reload_config(),
             Action::Copy => {

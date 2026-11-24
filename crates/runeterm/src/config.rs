@@ -247,7 +247,7 @@ impl Config {
              cursor-style = {style}\n\
              # 0 hides runeterm's cursor, for a shader that draws its own (cursor_glide.glsl).\n\
              cursor-opacity = {}\n\
-             # Glide between cells instead of jumping.\n\
+             # Glide between cells instead of jumping (long jumps, like a paste, still jump).\n\
              smooth-cursor = {}\n\
              \n\
              # --- Shaders (Ghostty/Shadertoy GLSL, paths relative to this folder) ---\n\
@@ -406,7 +406,7 @@ impl Config {
                     }
                 }
                 "cursor-opacity" => self.cursor_opacity = v.parse().unwrap_or(self.cursor_opacity),
-                "smooth-cursor" | "runeterm-smooth-cursor" => self.cursor_smooth = v != "false",
+                "smooth-cursor" | "runeterm-smooth-cursor" => self.cursor_smooth = !matches!(v, "false" | "off" | "no" | "0"),
                 "custom-shader" if v.is_empty() => self.shaders.clear(),
                 "custom-shader" => {
                     let p = v.strip_prefix("~/").map_or_else(

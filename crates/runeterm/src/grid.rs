@@ -16,6 +16,9 @@ use swash::zeno::Format;
 use swash::FontRef;
 
 const ATLAS: u32 = 2048;
+/// `smooth-cursor` glides over moves up to this far; longer ones jump.
+const GLIDE_MAX_COLS: f32 = 12.0;
+const GLIDE_MAX_ROWS: f32 = 2.0;
 
 /// Where a pane's grid is, for turning pointer positions into cells: device pixels per point,
 /// the padding and cell size in device pixels, and the grid's size.
@@ -1440,7 +1443,12 @@ impl GridRenderer {
             p.cursor_prev_style = p.cursor_style;
             p.cursor_changed = self.time;
             p.cursor_rect = target;
-            if p.cursor.is_none() || !self.cursor_smooth {
+            // Glide over short moves (typing, a word, a line up or down). A long jump (a paste,
+            // output, an editor jumping across the file) lands at once: gliding there would drag
+            // the cursor over everything in between.
+            let (dx, dy) = ((target[0] - p.cursor_rect[0]).abs() / m.w, (target[1] - p.cursor_rect[1]).abs() / m.h);
+            let far = dx > GLIDE_MAX_COLS || dy > GLIDE_MAX_ROWS;
+            if p.cursor.is_none() || !self.cursor_smooth || far {
                 p.cursor_drawn = target;
             }
         }
