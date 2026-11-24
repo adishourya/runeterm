@@ -21,6 +21,12 @@ outlive the window and come back after a reboot.
 - **Real text rendering.** Text is shaped, so ligatures show as in Ghostty, with
   `font-feature`, `font-style`, `font-variation` and made-up bold and italic for families that
   lack them. Kitty graphics, box drawing drawn to the cell, colour emoji and font fallback.
+- **Variable fonts, weight and width.** Pick a variable font's weight (Thin to Black) for
+  regular and bold text, and its width (Condensed to Expanded) for all of it, from the palette:
+  each shows in the terminals as you arrow through, Enter keeps it and Esc puts the old one
+  back. Weights and widths come from the family's variable file even when its static faces are
+  installed too, the cells narrow or widen with the width, and a family with no italics gets
+  slanted ones at the same weight.
 - **Fast.** It keeps up with the pty end to end, through spooky too (see
   [Performance](#performance)).
 
