@@ -509,7 +509,7 @@ pub fn set(key: &str, value: &str) -> std::io::Result<()> {
             let is_key = !t.starts_with('#') && t.split_once('=').is_some_and(|(k, _)| k.trim() == key);
             if is_key && !done {
                 done = true;
-                format!("{key} = {value}")
+                keep_spacing(l, value)
             } else {
                 l.to_string()
             }
@@ -519,6 +519,14 @@ pub fn set(key: &str, value: &str) -> std::io::Result<()> {
         out.push(format!("{key} = {value}"));
     }
     std::fs::write(&path, out.join("\n") + "\n")
+}
+
+/// Line `l` (`key = value`) with a new value, its key and the spacing around the `=` as they
+/// were, so a column of aligned settings stays aligned.
+fn keep_spacing(l: &str, value: &str) -> String {
+    let eq = l.find('=').unwrap_or(l.len());
+    let gap = l[eq + 1..].len() - l[eq + 1..].trim_start().len();
+    format!("{}{}{value}", &l[..=eq.min(l.len() - 1)], &l[eq + 1..eq + 1 + gap])
 }
 
 /// Like `set`, but for a key that may repeat (`font-variation`): the first uncommented line
@@ -535,7 +543,7 @@ pub fn replace(key: &str, value: &str) -> std::io::Result<()> {
             out.push(l.to_string());
         } else if !done {
             done = true;
-            out.push(format!("{key} = {value}"));
+            out.push(keep_spacing(l, value));
         }
     }
     if !done {
@@ -661,6 +669,13 @@ mod tests {
         assert_eq!(back.sidebar, c.sidebar);
         assert_eq!((back.accent, back.accents.clone(), back.scrollback_editor.clone()), (c.accent, c.accents.clone(), c.scrollback_editor.clone()));
         assert_eq!(back.light, c.light);
+    }
+
+    #[test]
+    fn a_saved_value_keeps_the_lines_alignment() {
+        assert_eq!(keep_spacing("font-size     = 18", "21"), "font-size     = 21");
+        assert_eq!(keep_spacing("padding=0", "4"), "padding=4");
+        assert_eq!(keep_spacing("  theme = dark", "light"), "  theme = light");
     }
 
     #[test]

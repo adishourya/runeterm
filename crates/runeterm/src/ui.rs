@@ -1072,12 +1072,7 @@ fn palette(s: &State) -> El {
     let field = rune::text_input(&p.edit, TextStyle::new(15.0, 500.0))
         .key("palette-field")
         .single_line()
-        .placeholder(match p.pick.as_ref().map(|w| (w.axis, w.style)) {
-            Some((crate::keys::Axis::Width, _)) => "Width for all text (or type one)…",
-            Some((_, 0)) => "Weight for regular text (or type one)…",
-            Some(_) => "Weight for bold text (or type one)…",
-            None => "Type a command…",
-        }, look::faint())
+.placeholder(p.pick.as_ref().map_or("Type a command…", |w| w.prompt()), look::faint())
         .caret(look::accent(), look::accent().alpha(0.3))
         .color(look::text())
         .on_edit(|s: &mut State| &mut s.palette.as_mut().expect("palette open").edit)
@@ -1118,7 +1113,7 @@ fn palette(s: &State) -> El {
         .child(row().h(30.0).px(16.0).gap(14.0).items_center().border_sides([1.0, 0.0, 0.0, 0.0], look::ink(0.05))
             .child(text(if p.pick.is_some() { "↑↓ try · ↩ keep · esc put back" } else { "↑↓ choose · ↩ run · esc close" }).font(SMALL).color(look::faint()))
             .child(el().grow(1.0))
-            .child(text(if p.pick.is_some() { "saved as font-variation" } else { "keybind = CHORD=ACTION in the config" }).font(SMALL).color(look::faint())));
+            .child(text(if p.pick.is_some() { "saved in the config" } else { "keybind = CHORD=ACTION in the config" }).font(SMALL).color(look::faint())));
     el().key("palette-layer").pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0)).raise()
         .child(el().pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0)).fill(look::shade(0.25)).on_press(|s: &mut State| s.close_palette()))
         .child(row().w_full().justify_center().items_start().pt(90.0).child(panel))
@@ -1191,13 +1186,22 @@ pub fn spec() -> AppSpec<State> {
             }),
             ("palette-weights", |s| {
                 // The weight list for a variable font's regular text, 450 in use.
-                let pick = crate::state::AxisPick { axis: crate::keys::Axis::Weight, style: 0, family: "Geist Mono".into(), range: Some((100.0, 400.0, 900.0)), current: 450.0, previewed: false };
+                let pick = crate::state::Pick { setting: crate::keys::Setting::Weight, family: "Geist Mono".into(), range: Some((100.0, 400.0, 900.0)), current: 450.0, previewed: false };
                 s.palette = Some(crate::state::Palette { edit: rune::TextEdit::new(""), chosen: 4, pick: Some(pick) });
             }),
             ("palette-widths", |s| {
                 // The width list for Martian Mono, SemiCondensed chosen.
-                let pick = crate::state::AxisPick { axis: crate::keys::Axis::Width, style: 0, family: "Martian Mono".into(), range: Some((75.0, 112.5, 112.5)), current: 100.0, previewed: false };
+                let pick = crate::state::Pick { setting: crate::keys::Setting::Width, family: "Martian Mono".into(), range: Some((75.0, 112.5, 112.5)), current: 100.0, previewed: false };
                 s.palette = Some(crate::state::Palette { edit: rune::TextEdit::new(""), chosen: 1, pick: Some(pick) });
+            }),
+            ("palette-font", |s| {
+                // The palette's font and text settings.
+                s.palette = Some(crate::state::Palette { edit: rune::TextEdit::new("font"), chosen: 0, pick: None });
+            }),
+            ("palette-sizes", |s| {
+                // The font size list, 20 pt in use.
+                let pick = crate::state::Pick { setting: crate::keys::Setting::FontSize, family: "Martian Mono".into(), range: Some((4.0, 13.0, 96.0)), current: 20.0, previewed: false };
+                s.palette = Some(crate::state::Palette { edit: rune::TextEdit::new(""), chosen: 12, pick: Some(pick) });
             }),
             ("palette-filtered", |s| {
                 s.palette = Some(crate::state::Palette { edit: rune::TextEdit::new("flo"), chosen: 0, pick: None });
@@ -1325,6 +1329,43 @@ mod tests {
 
     fn alt() -> Mods {
         Mods { alt: true, ..Mods::default() }
+    }
+
+    /// ⌥⇧2 through Rune's key routing moves the focused split to tab 2, though the key types
+    /// "@"; ⌥⇧0 moves it to a new tab.
+    #[test]
+    fn alt_shift_digits_move_the_split_between_tabs() {
+        let mut s = State::new(&Config::default(), false, None);
+        s.split(Dir::Right);
+        s.new_tab(None);
+        s.select_tab(0);
+        let moving = s.tabs[0].focused;
+        let mut rt = Runtime::new(s, view, (1280.0, 780.0), Env::new(true, 1.0));
+        rt.on_key = Some(|s, e, tx| s.key(e, tx));
+        rt.frame(0.0);
+        let alt_shift = Mods { alt: true, shift: true, ..Mods::default() };
+        press(&mut rt, Key::Text("@".into()), alt_shift);
+        assert!(rt.state.tabs[1].has(moving), "in tab 2");
+        assert_eq!(rt.state.active, 1, "and followed there");
+        press(&mut rt, Key::Text(")".into()), alt_shift);
+        assert_eq!(rt.state.tabs.len(), 3);
+        assert!(rt.state.tabs[2].has(moving), "in a new tab");
+    }
+
+    /// ctrl+= and ctrl+- change the size for now, ctrl+0 puts it back.
+    #[test]
+    fn ctrl_equals_and_minus_size_the_text_for_now() {
+        let mut rt = Runtime::new(State::new(&Config::default(), false, None), view, (1280.0, 780.0), Env::new(true, 1.0));
+        rt.on_key = Some(|s, e, tx| s.key(e, tx));
+        rt.frame(0.0);
+        let ctrl = Mods { ctrl: true, ..Mods::default() };
+        press(&mut rt, Key::Text("=".into()), ctrl);
+        press(&mut rt, Key::Text("=".into()), ctrl);
+        assert_eq!(rt.state.font_delta, 2.0);
+        press(&mut rt, Key::Text("-".into()), ctrl);
+        assert_eq!(rt.state.font_delta, 1.0);
+        press(&mut rt, Key::Text("0".into()), ctrl);
+        assert_eq!(rt.state.font_delta, 0.0);
     }
 
     /// The palette end to end through Rune's key routing: ⌥P opens it with its field focused,

@@ -2,7 +2,7 @@
 //! keys to the focused pane.
 
 use crate::config::Config;
-use crate::keys::{Action, Axis, Keybinds};
+use crate::keys::{Action, Keybinds, Setting};
 use crate::pane::{Pane, Source, Theme};
 use crate::spooky::{self, Controller, Event, SessionInfo};
 use crate::split::{Dir, Node, Place, Side};
@@ -87,37 +87,44 @@ impl Tab {
 pub struct Palette {
     pub edit: rune::TextEdit,
     pub chosen: usize,
-    /// Set while the palette lists a font axis's values (weights, widths) instead of actions.
-    pub pick: Option<AxisPick>,
+    /// Set while the palette lists a setting's values (font weights, sizes…) instead of
+    /// actions.
+    pub pick: Option<Pick>,
 }
 
-/// The palette's list of a font axis's values: which axis, for which style, and its range.
-pub struct AxisPick {
-    pub axis: Axis,
-    /// 0 regular, 1 bold. A width is every style's, and saved as regular's.
-    pub style: u8,
-    /// The face's family, for saying it has no such axis.
+/// The palette's list of a setting's values, each tried as it's chosen and kept with Enter.
+pub struct Pick {
+    pub setting: Setting,
+    /// The font's family, for saying it has no such axis.
     pub family: String,
-    /// The axis: (min, default, max), None for a font that doesn't vary on it.
+    /// The values it takes: (min, default, max). None for a font axis the font lacks.
     pub range: Option<(f32, f32, f32)>,
-    /// The value in the config now.
+    /// The value in the config now (a choice's index for the cursor style).
     pub current: f32,
     /// A value is being shown that isn't saved: put the config's back when closed.
     pub previewed: bool,
 }
 
-/// An axis value's usual name ("Light" for wght 300, "SemiCondensed" for wdth 87.5), or the
-/// axis's between them.
-fn axis_name(axis: Axis, v: f32) -> &'static str {
-    let named: &[(f32, &str)] = match axis {
-        Axis::Weight => &[(100.0, "Thin"), (200.0, "ExtraLight"), (300.0, "Light"), (400.0, "Regular"), (500.0, "Medium"),
-            (600.0, "SemiBold"), (700.0, "Bold"), (800.0, "ExtraBold"), (900.0, "Black")],
-        Axis::Width => &[(50.0, "UltraCondensed"), (62.5, "ExtraCondensed"), (75.0, "Condensed"), (87.5, "SemiCondensed"),
-            (100.0, "Normal"), (112.5, "SemiExpanded"), (125.0, "Expanded"), (150.0, "ExtraExpanded"), (200.0, "UltraExpanded")],
-    };
-    let between = match axis {
-        Axis::Weight => "Weight",
-        Axis::Width => "Width",
+/// `cursor-style`'s values and their names in the palette.
+const CURSOR_STYLES: [(&str, &str); 4] = [("bar", "Bar"), ("block", "Block"), ("underline", "Underline"), ("block_hollow", "Hollow block")];
+
+fn cursor_index(c: vt::CursorStyle) -> usize {
+    match c {
+        vt::CursorStyle::Bar => 0,
+        vt::CursorStyle::Block => 1,
+        vt::CursorStyle::Underline => 2,
+        vt::CursorStyle::BlockHollow => 3,
+    }
+}
+
+/// A font axis value's usual name ("Light" for wght 300, "SemiCondensed" for wdth 87.5), or
+/// the axis's between them.
+fn axis_name(setting: Setting, v: f32) -> &'static str {
+    let (named, between): (&[(f32, &str)], &str) = match setting {
+        Setting::Width => (&[(50.0, "UltraCondensed"), (62.5, "ExtraCondensed"), (75.0, "Condensed"), (87.5, "SemiCondensed"),
+            (100.0, "Normal"), (112.5, "SemiExpanded"), (125.0, "Expanded"), (150.0, "ExtraExpanded"), (200.0, "UltraExpanded")], "Width"),
+        _ => (&[(100.0, "Thin"), (200.0, "ExtraLight"), (300.0, "Light"), (400.0, "Regular"), (500.0, "Medium"),
+            (600.0, "SemiBold"), (700.0, "Bold"), (800.0, "ExtraBold"), (900.0, "Black")], "Weight"),
     };
     named.iter().find(|(n, _)| *n == v).map_or(between, |(_, name)| name)
 }
@@ -125,6 +132,111 @@ fn axis_name(axis: Axis, v: f32) -> &'static str {
 /// Tenths, as the palette's rows carry values (87.5 is 875).
 fn tenths(v: f32) -> u32 {
     (v * 10.0).round().max(0.0) as u32
+}
+
+impl Pick {
+    /// What the palette's field says while it lists this setting.
+    pub fn prompt(&self) -> &'static str {
+        match self.setting {
+            Setting::Weight => "Weight for regular text (or type one)…",
+            Setting::BoldWeight => "Weight for bold text (or type one)…",
+            Setting::Width => "Width for all text (or type one)…",
+            Setting::FontSize => "Font size in points (or type one)…",
+            Setting::LinePercent => "Extra line height, % of the font's (or type 4px)…",
+            Setting::LinePixels => "Extra line height in pixels (or type 20%)…",
+            Setting::Fit => "How far the size may relax so lines fill a split…",
+            Setting::Padding => "Space around the text, in points (or type one)…",
+            Setting::CursorStyle => "Cursor style…",
+        }
+    }
+
+    /// The values to offer: the usual ones in range, then (for a font axis) the range's ends
+    /// and default.
+    fn values(&self) -> Vec<f32> {
+        let Some((lo, def, hi)) = self.range else { return vec![] };
+        let usual: Vec<f32> = match self.setting {
+            Setting::Weight | Setting::BoldWeight => (1..=9).map(|n| n as f32 * 100.0).collect(),
+            Setting::Width => vec![50.0, 62.5, 75.0, 87.5, 100.0, 112.5, 125.0, 150.0, 200.0],
+            Setting::FontSize => vec![8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 20.0, 21.0, 22.0, 24.0, 26.0, 28.0, 32.0, 36.0, 40.0, 48.0],
+            Setting::LinePercent => (0..=20).map(|n| n as f32 * 5.0).collect(),
+            Setting::LinePixels => (0..=24).map(|n| n as f32 * 2.0).collect(),
+            Setting::Fit => vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 12.0, 15.0],
+            Setting::Padding => vec![0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 20.0, 24.0, 32.0],
+            Setting::CursorStyle => (0..CURSOR_STYLES.len()).map(|i| i as f32).collect(),
+        };
+        let mut vs: Vec<f32> = usual.into_iter().filter(|v| (lo..=hi).contains(v)).collect();
+        if self.setting.axis().is_some() {
+            vs.extend([lo, def, hi]);
+        }
+        vs
+    }
+
+    /// The default to mark: the font's for an axis, runeterm's for the rest.
+    fn default(&self) -> Option<f32> {
+        match self.setting {
+            Setting::LinePixels => None,
+            Setting::FontSize => Some(13.0),
+            Setting::Padding => Some(10.0),
+            Setting::CursorStyle => Some(0.0),
+            _ => self.range.map(|r| r.1),
+        }
+    }
+}
+
+/// A row's title: what the value is called.
+fn value_title(setting: Setting, v: f32) -> String {
+    match setting {
+        Setting::Weight | Setting::BoldWeight | Setting::Width => format!("{} · {v}", axis_name(setting, v)),
+        Setting::FontSize | Setting::Padding => format!("{v} pt"),
+        Setting::LinePercent => format!("{v}% taller than the font's own"),
+        Setting::LinePixels => format!("{v} px"),
+        Setting::Fit if v == 0.0 => "Off: the exact size".into(),
+        Setting::Fit => format!("Up to {v}%"),
+        Setting::CursorStyle => CURSOR_STYLES.get(v as usize).map_or("", |c| c.1).into(),
+    }
+}
+
+/// `c` with `setting` at `v`, as it'd be once saved.
+fn apply_setting(c: &mut Config, setting: Setting, v: f32) {
+    let f = &mut c.font;
+    match setting {
+        Setting::Weight => f.variations[0] = crate::grid::with_axis(&f.variations[0], "wght", v),
+        Setting::BoldWeight => f.variations[1] = crate::grid::with_axis(&f.variations[1], "wght", v),
+        Setting::Width => f.variations[0] = crate::grid::with_axis(&f.variations[0], "wdth", v),
+        Setting::FontSize => f.size = v,
+        Setting::LinePercent => (f.cell_height, f.cell_height_px) = (v / 100.0, 0.0),
+        Setting::LinePixels => (f.cell_height, f.cell_height_px) = (0.0, v),
+        Setting::Fit => f.fit = v / 100.0,
+        Setting::Padding => f.padding = v,
+        Setting::CursorStyle => {
+            c.cursor_style = match v as usize {
+                1 => vt::CursorStyle::Block,
+                2 => vt::CursorStyle::Underline,
+                3 => vt::CursorStyle::BlockHollow,
+                _ => vt::CursorStyle::Bar,
+            }
+        }
+    }
+}
+
+/// Writes `setting` at `v` to the config file: font axes into their `font-variation` line
+/// (other axes kept), the rest as their own key.
+fn save_setting(setting: Setting, v: f32) -> std::io::Result<()> {
+    let axes = |i: usize, tag: &str| {
+        let vs = crate::grid::with_axis(&Config::load().font.variations[i], tag, v);
+        vs.iter().map(|(t, v)| format!("{t}={v}")).collect::<Vec<_>>().join(", ")
+    };
+    match setting {
+        Setting::Weight => crate::config::replace("font-variation", &axes(0, "wght")),
+        Setting::BoldWeight => crate::config::replace("font-variation-bold", &axes(1, "wght")),
+        Setting::Width => crate::config::replace("font-variation", &axes(0, "wdth")),
+        Setting::FontSize => crate::config::set("font-size", &v.to_string()),
+        Setting::LinePercent => crate::config::set("line-height", &format!("{v}%")),
+        Setting::LinePixels => crate::config::set("line-height", &v.to_string()),
+        Setting::Fit => crate::config::set("font-size-fit", &format!("{v}%")),
+        Setting::Padding => crate::config::set("padding", &v.to_string()),
+        Setting::CursorStyle => crate::config::set("cursor-style", CURSOR_STYLES.get(v as usize).map_or("bar", |c| c.0)),
+    }
 }
 
 /// What the session picker shows.
@@ -187,6 +299,10 @@ pub struct State {
     /// Panes a desktop notification went out for, until they're seen.
     notified: std::collections::HashSet<u32>,
     pub settings: Behaviour,
+    /// Points added to the config's font size for now (ctrl+= and ctrl+-), not saved.
+    pub font_delta: f32,
+    /// The split editing the config (Edit config): the config reloads when it closes.
+    pub config_editor: Option<u32>,
     /// Appearance: light mode, the accent, and the accents to choose from.
     pub light: bool,
     /// The accent shown: this session's own, or `default_accent` outside a session.
@@ -306,6 +422,8 @@ impl State {
             appearance_open: false,
             notified: Default::default(),
             settings: Behaviour::from(config),
+            font_delta: 0.0,
+            config_editor: None,
             light: config.light,
             accent: config.accent,
             default_accent: config.accent,
@@ -712,6 +830,10 @@ impl State {
         let exited: Vec<u32> = self.panes.values().filter(|p| p.exited.load(Ordering::Acquire)).map(|p| p.id).collect();
         for id in exited {
             self.forget(id);
+            if self.config_editor == Some(id) {
+                self.config_editor = None;
+                self.reload_config();
+            }
             changed = true;
         }
         for p in self.panes.values() {
@@ -1053,7 +1175,13 @@ impl State {
     /// Re-reads `~/.config/runeterm/config` (⌥R): new colours for every terminal now, and the
     /// renderer picks up the font, cursor and shaders on its next frame.
     pub fn reload_config(&mut self) {
-        let c = Config::load();
+        self.apply_config(Config::load());
+    }
+
+    /// Puts config `c` in effect: the window's settings, every terminal's colours and cursor,
+    /// and the renderer's font (with the font size for now, ctrl+=, on top).
+    fn apply_config(&mut self, mut c: Config) {
+        c.font.size = (c.font.size + self.font_delta).max(4.0);
         self.sidebar = c.sidebar;
         self.settings = Behaviour::from(&c);
         self.scrollback_editor = c.scrollback_editor.clone();
@@ -1219,10 +1347,17 @@ impl State {
             Action::ToggleSidebar => self.toggle_sidebar(),
             Action::ToggleTheme => self.set_light(!self.light),
             Action::ToggleSmoothCursor => self.set_smooth_cursor(!Config::load().cursor_smooth),
-            Action::FontWeight => self.open_axis(Axis::Weight, 0, tx),
-            Action::BoldFontWeight => self.open_axis(Axis::Weight, 1, tx),
-            Action::FontWidth => self.open_axis(Axis::Width, 0, tx),
-            Action::SetAxis(axis, style, v) => self.set_axis(axis, style, v),
+            Action::Pick(setting) => self.open_pick(setting, tx),
+            Action::Set(setting, v) => self.set_setting(setting, v),
+            Action::FontBigger => self.nudge_font(1.0),
+            Action::FontSmaller => self.nudge_font(-1.0),
+            Action::FontReset => self.nudge_font(0.0),
+            Action::ToggleCopyOnSelect => self.toggle_setting("copy-on-select", self.settings.copy_on_select),
+            Action::ToggleConfirmClose => self.toggle_setting("confirm-close", self.settings.confirm_close),
+            Action::ToggleNotifications => self.toggle_setting("notifications", self.settings.notifications),
+            Action::EditConfig => self.edit_config(),
+            Action::MoveToTab(n) => focused.into_iter().for_each(|id| self.move_to_tab(id, Some(n as usize - 1))),
+            Action::MoveToNewTab => focused.into_iter().for_each(|id| self.move_to_tab(id, None)),
             Action::EditScrollback => self.edit_scrollback(),
             Action::ReloadConfig => self.reload_config(),
             Action::Copy => {
@@ -1244,102 +1379,231 @@ impl State {
         }
     }
 
-    /// Closes the palette, undoing a weight it was showing but didn't save.
+    /// Closes the palette, undoing a value it was showing but didn't save.
     pub fn close_palette(&mut self) {
         if self.palette.take().is_some_and(|p| p.pick.is_some_and(|w| w.previewed)) {
-            crate::config::publish(Config::load());
+            self.reload_config();
         }
     }
 
-    /// Opens the palette on the font's values for `axis` and `style` (0 regular, 1 bold), on
-    /// the one in use now.
-    pub fn open_axis(&mut self, axis: Axis, style: u8, tx: &mut Tx) {
-        let spec = Config::load().font;
-        let i = style as usize;
-        let range = crate::grid::font_axis(&spec, i, axis.tag());
-        let family = i.checked_sub(1).and_then(|j| spec.families[j].clone()).unwrap_or_else(|| spec.family.clone());
-        let set = match axis {
-            Axis::Weight => spec.variations[i].iter().find(|(t, _)| t == "wght").map(|(_, v)| *v),
-            Axis::Width => crate::grid::shared_width(&spec.variations),
+    /// Opens the palette on `setting`'s values, on the one in use now. Line height is listed
+    /// in the config's unit (pixels or percent).
+    pub fn open_pick(&mut self, setting: Setting, tx: &mut Tx) {
+        let c = Config::load();
+        let f = &c.font;
+        let style = (setting == Setting::BoldWeight) as usize;
+        let axis = |tag: &str| crate::grid::font_axis(f, style, tag);
+        let own = |tag: &str| f.variations[style].iter().find(|(t, _)| t == tag).map(|(_, v)| *v);
+        let (setting, range, current) = match setting {
+            Setting::Weight | Setting::BoldWeight => {
+                let range = axis("wght");
+                (setting, range, own("wght").or(range.map(|r| r.1)).unwrap_or(400.0))
+            }
+            Setting::Width => {
+                let range = axis("wdth");
+                (setting, range, crate::grid::shared_width(&f.variations).or(range.map(|r| r.1)).unwrap_or(100.0))
+            }
+            // Picking a size starts from the config's, not one for now (ctrl+=).
+            Setting::FontSize => (setting, Some((4.0, 13.0, 96.0)), f.size),
+            Setting::LinePercent | Setting::LinePixels if f.cell_height_px != 0.0 => (Setting::LinePixels, Some((0.0, 0.0, 100.0)), f.cell_height_px),
+            Setting::LinePercent | Setting::LinePixels => (Setting::LinePercent, Some((0.0, 0.0, 200.0)), f.cell_height * 100.0),
+            Setting::Fit => (setting, Some((0.0, 0.0, 15.0)), f.fit * 100.0),
+            Setting::Padding => (setting, Some((0.0, 10.0, 100.0)), f.padding),
+            Setting::CursorStyle => (setting, Some((0.0, 0.0, 3.0)), cursor_index(c.cursor_style) as f32),
         };
-        let current = set.or(range.map(|r| r.1)).unwrap_or(400.0);
-        let pick = AxisPick { axis, style, family, range, current, previewed: false };
+        if setting == Setting::FontSize && self.font_delta != 0.0 {
+            self.font_delta = 0.0;
+            self.reload_config();
+        }
+        let family = if style == 1 { f.families[0].clone().unwrap_or_else(|| f.family.clone()) } else { f.family.clone() };
+        let pick = Pick { setting, family, range, current, previewed: false };
         self.palette = Some(Palette { edit: rune::TextEdit::new(""), chosen: 0, pick: Some(pick) });
-        let at = self.palette_items().iter().position(|r| matches!(r.0, Action::SetAxis(_, _, v) if v == tenths(current)));
+        let items = self.palette_items();
+        let at = items.iter().position(|r| matches!(r.0, Action::Set(_, v) if v == tenths(current)));
         if let Some(p) = self.palette.as_mut() {
             p.chosen = at.unwrap_or(0);
         }
         tx.focus("palette-field", false);
+        // The one in use may be below the fold (20 pt in the size list).
+        if let Some((a, ..)) = at.and_then(|i| items.get(i)) {
+            tx.scroll_into_view_in("palette-list", format!("palette-{}", a.id()));
+        }
     }
 
-    /// Saves `axis` at `v` tenths for `style` in its `font-variation` (other axes kept) and
-    /// applies it. A width goes in regular's, which every style takes.
-    pub fn set_axis(&mut self, axis: Axis, style: u8, v: u32) {
-        let i = match axis {
-            Axis::Weight => (style as usize).min(1),
-            Axis::Width => 0,
-        };
-        let vs = crate::grid::with_axis(&Config::load().font.variations[i], axis.tag(), v as f32 / 10.0);
-        let key = ["font-variation", "font-variation-bold"][i];
-        let value = vs.iter().map(|(t, v)| format!("{t}={v}")).collect::<Vec<_>>().join(", ");
-        if let Err(e) = crate::config::replace(key, &value) {
-            eprintln!("runeterm: can't save {key}: {e}");
+    /// Saves `setting` at `v` tenths to the config and applies it.
+    pub fn set_setting(&mut self, setting: Setting, v: u32) {
+        if let Err(e) = save_setting(setting, v as f32 / 10.0) {
+            eprintln!("runeterm: can't save {}: {e}", setting.name());
+        }
+        if setting == Setting::FontSize {
+            self.font_delta = 0.0;
         }
         self.reload_config();
     }
 
     /// Shows the chosen row's value in every terminal, without saving it.
-    fn preview_axis(&mut self) {
-        let Some(Action::SetAxis(axis, style, v)) = self.palette.as_ref().and_then(|p| self.palette_items().get(p.chosen).map(|r| r.0)) else { return };
+    fn preview_pick(&mut self) {
+        let Some(Action::Set(setting, v)) = self.palette.as_ref().and_then(|p| self.palette_items().get(p.chosen).map(|r| r.0)) else { return };
         let mut c = Config::load();
-        let i = if axis == Axis::Width { 0 } else { style as usize };
-        c.font.variations[i] = crate::grid::with_axis(&c.font.variations[i], axis.tag(), v as f32 / 10.0);
-        crate::config::publish(c);
+        apply_setting(&mut c, setting, v as f32 / 10.0);
+        self.apply_config(c);
         if let Some(pick) = self.palette.as_mut().and_then(|p| p.pick.as_mut()) {
             pick.previewed = true;
+        }
+    }
+
+    /// The font size for now (`by` points bigger, or back to the config's at 0), as Ghostty's
+    /// ctrl+= and ctrl+- do: not saved, and kept across config reloads.
+    pub fn nudge_font(&mut self, by: f32) {
+        let size = Config::load().font.size;
+        self.font_delta = if by == 0.0 { 0.0 } else { (self.font_delta + by).clamp(4.0 - size, 96.0 - size) };
+        self.reload_config();
+    }
+
+    /// Flips an on/off setting in the config, and applies it.
+    fn toggle_setting(&mut self, key: &str, on: bool) {
+        if let Err(e) = crate::config::set(key, if on { "false" } else { "true" }) {
+            eprintln!("runeterm: can't save {key}: {e}");
+        }
+        self.reload_config();
+    }
+
+    /// Opens the config in the scrollback editor, in a split beside this one; closing the
+    /// editor reloads it.
+    pub fn edit_config(&mut self) {
+        let path = crate::config::path();
+        let cwd = path.parent().map(|d| d.display().to_string());
+        let command = editor_command(&self.scrollback_editor, &path, 1);
+        let id = self.next_id;
+        self.next_id += 1;
+        match Pane::spawn(id, Source::Local { cwd: cwd.as_deref(), command: Some(&command) }, &self.theme, Some(Arc::new(wake))) {
+            Ok(mut p) => {
+                p.program = command[0].rsplit('/').next().unwrap_or("vim").to_string();
+                self.panes.insert(id, p);
+                let tab = &mut self.tabs[self.active];
+                tab.root.split(tab.focused, id, Dir::Right);
+                tab.focused = id;
+                tab.zoomed = false;
+                self.config_editor = Some(id);
+            }
+            Err(e) => eprintln!("runeterm: can't start {}: {e}", self.scrollback_editor),
+        }
+    }
+
+    /// Moves split `id` to tab `to` (0-based; past the last tab, or None, a new one), beside
+    /// that tab's focused split, and follows it there. A floating split floats there too. The
+    /// tab it leaves closes if it was its last split.
+    pub fn move_to_tab(&mut self, id: u32, to: Option<usize>) {
+        let Some(from) = self.tabs.iter().position(|t| t.has(id)) else { return };
+        let to = to.filter(|&t| t < self.tabs.len());
+        let alone = self.tabs[from].panes().len() == 1;
+        if to == Some(from) || (alone && to.is_none()) {
+            return;
+        }
+        // Out of its tab.
+        let tab = &mut self.tabs[from];
+        let floating = tab.floating.iter().position(|f| f.id == id).map(|i| tab.floating.remove(i));
+        tab.minimized.retain(|m| m.id != id);
+        let mut closed = false;
+        if tab.root.contains(id) {
+            match tab.root.remove(id) {
+                Some(rest) => tab.root = rest,
+                None => {
+                    if let Some(m) = tab.minimized.pop() {
+                        tab.root = Node::Leaf(m.id);
+                    } else if let Some(f) = tab.floating.pop() {
+                        tab.root = Node::Leaf(f.id);
+                    } else {
+                        closed = true;
+                    }
+                }
+            }
+        }
+        if !closed {
+            if tab.focused == id {
+                tab.focused = tab.root.first();
+            }
+            tab.zoomed = false;
+        }
+        // Into the other.
+        let dest = match to {
+            Some(t) => {
+                let d = &mut self.tabs[t];
+                match floating {
+                    Some(f) => d.floating.push(Floating { place: None, ..f }),
+                    None => {
+                        let at = if d.root.contains(d.focused) { d.focused } else { d.root.first() };
+                        d.root.insert(at, id, Dir::Right, 0.5, false);
+                    }
+                }
+                d.focused = id;
+                d.zoomed = false;
+                t
+            }
+            None => {
+                // In a tab of its own, a floating split is the tab's layout.
+                let tab = self.tab_id();
+                self.tabs.push(Tab { id: tab, root: Node::Leaf(id), focused: id, zoomed: false, minimized: vec![], floating: vec![] });
+                self.tabs.len() - 1
+            }
+        };
+        if closed {
+            self.tabs.remove(from);
+            let dest = if dest > from { dest - 1 } else { dest };
+            self.slide = if dest >= from { 1.0 } else { -1.0 };
+            self.active = dest;
+        } else {
+            self.select_tab(dest);
         }
     }
 
     /// What the palette says when it has no rows.
     pub fn palette_empty(&self) -> String {
         match self.palette.as_ref().and_then(|p| p.pick.as_ref()) {
-            Some(p) if p.range.is_none() && p.axis == Axis::Weight => format!("{} has no weight axis (pick a face with font-style instead)", p.family),
-            Some(p) if p.range.is_none() => format!("{} has no width axis", p.family),
-            Some(_) => "Not in the font's range".into(),
+            Some(p) if p.range.is_none() && p.setting == Setting::Width => format!("{} has no width axis", p.family),
+            Some(p) if p.range.is_none() => format!("{} has no weight axis (pick a face with font-style instead)", p.family),
+            Some(_) => "Not a value it takes".into(),
             None => "No matching command".into(),
         }
     }
 
-    /// An axis list's rows: the axis's named values in its range (weights in hundreds,
-    /// Condensed to Expanded), its ends, its default, the current value and a number typed,
-    /// smallest first. The chip says which is in use.
-    fn axis_items(p: &AxisPick, query: &str) -> Vec<(Action, String, String)> {
-        let Some((lo, def, hi)) = p.range else { return vec![] };
+    /// A setting's rows: its usual values in range, its current one and a number typed,
+    /// smallest first. The chip says which is in use, and which is the default. A line height
+    /// typed with % or px is listed in that unit.
+    fn pick_items(p: &Pick, query: &str) -> Vec<(Action, String, String)> {
+        let Some((lo, _, hi)) = p.range else { return vec![] };
         let query = query.trim();
-        let typed = query.parse::<f32>().ok();
-        let r = |x: f32| tenths(x.clamp(lo, hi));
-        let named: &[f32] = match p.axis {
-            Axis::Weight => &[100.0, 200.0, 300.0, 400.0, 500.0, 600.0, 700.0, 800.0, 900.0],
-            Axis::Width => &[50.0, 62.5, 75.0, 87.5, 100.0, 112.5, 125.0, 150.0, 200.0],
+        let number = query.trim_end_matches(['%', 'p', 't', 'x']).trim();
+        let typed = (p.setting != Setting::CursorStyle).then(|| number.parse::<f32>().ok()).flatten();
+        let mut rows: Vec<(Setting, f32)> = p.values().into_iter().map(|v| (p.setting, v)).collect();
+        rows.push((p.setting, p.current.clamp(lo, hi)));
+        if let Some(t) = typed {
+            let unit = match p.setting {
+                Setting::LinePixels | Setting::LinePercent if query.ends_with('%') => Setting::LinePercent,
+                Setting::LinePixels | Setting::LinePercent if query.ends_with("px") => Setting::LinePixels,
+                s => s,
+            };
+            if unit != p.setting || (lo..=hi).contains(&t) {
+                rows.push((unit, t.max(0.0)));
+            }
+        }
+        rows.sort_by(|a, b| (a.0 != p.setting).cmp(&(b.0 != p.setting)).then(a.1.total_cmp(&b.1)));
+        rows.dedup_by(|a, b| a.0 == b.0 && tenths(a.1) == tenths(b.1));
+        let mark = |s: Setting, v: f32| {
+            if s == p.setting && tenths(v) == tenths(p.current) {
+                "in use"
+            } else if s == p.setting && p.default().is_some_and(|d| tenths(d) == tenths(v)) {
+                if p.setting.axis().is_some() { "font default" } else { "default" }
+            } else {
+                ""
+            }
         };
-        let mut vs: Vec<u32> = named.iter().filter(|n| (lo..=hi).contains(*n)).map(|n| tenths(*n)).collect();
-        vs.extend([r(lo), r(def), r(hi), r(p.current)]);
-        vs.extend(typed.filter(|t| (lo..=hi).contains(t)).map(r));
-        vs.sort();
-        vs.dedup();
-        vs.into_iter()
-            .map(|n| {
-                let v = n as f32 / 10.0;
-                (n, v.to_string(), format!("{} · {v}", axis_name(p.axis, v)))
+        rows.into_iter()
+            .filter(|(s, v)| match typed {
+                Some(_) => v.to_string().starts_with(number) || *s != p.setting,
+                None => crate::keys::fuzzy(query, &value_title(*s, *v)).is_some(),
             })
-            .filter(|(_, v, title)| match typed {
-                Some(_) => v.starts_with(query),
-                None => crate::keys::fuzzy(query, title).is_some(),
-            })
-            .map(|(n, _, title)| {
-                let chip = if n == r(p.current) { "in use" } else if n == r(def) { "font default" } else { "" };
-                (Action::SetAxis(p.axis, p.style, n), title, chip.to_string())
-            })
+            .map(|(s, v)| (Action::Set(s, tenths(v)), value_title(s, v), mark(s, v).to_string()))
             .collect()
     }
 
@@ -1348,7 +1612,7 @@ impl State {
     pub fn palette_items(&self) -> Vec<(Action, String, String)> {
         let query = self.palette.as_ref().map_or(String::new(), |p| p.edit.text.clone());
         if let Some(pick) = self.palette.as_ref().and_then(|p| p.pick.as_ref()) {
-            return State::axis_items(pick, &query);
+            return State::pick_items(pick, &query);
         }
         let mut rows: Vec<(i32, usize, Action, String)> = Action::all()
             .enumerate()
@@ -1359,6 +1623,25 @@ impl State {
                         let tab = self.tabs.get(n as usize - 1)?;
                         let cwd = self.panes.get(&tab.focused).map(|p| p.cwd.clone()).unwrap_or_default();
                         format!("{} · {cwd}", a.title())
+                    }
+                    // To another tab that's there, with its directory; a new tab unless the
+                    // split is its tab's only one.
+                    Action::MoveToTab(n) => {
+                        let i = n as usize - 1;
+                        let tab = self.tabs.get(i).filter(|_| i != self.active)?;
+                        let cwd = self.panes.get(&tab.focused).map(|p| p.cwd.clone()).unwrap_or_default();
+                        format!("{} · {cwd}", a.title())
+                    }
+                    Action::MoveToNewTab if self.tab().is_none_or(|t| t.panes().len() < 2) => return None,
+                    Action::FontReset if self.font_delta == 0.0 => return None,
+                    Action::FontReset => format!("{} ({:+} pt now)", a.title(), self.font_delta),
+                    Action::ToggleCopyOnSelect | Action::ToggleConfirmClose | Action::ToggleNotifications => {
+                        let on = match a {
+                            Action::ToggleCopyOnSelect => self.settings.copy_on_select,
+                            Action::ToggleConfirmClose => self.settings.confirm_close,
+                            _ => self.settings.notifications,
+                        };
+                        format!("{} · now {}", a.title(), if on { "on" } else { "off" })
                     }
                     Action::Float if self.tab().is_some_and(|t| t.is_floating(t.focused)) => "Dock floating split".into(),
                     Action::PinFloat if self.focused_id().is_some_and(|id| self.is_pinned(id)) => "Unpin floating split".into(),
@@ -1399,7 +1682,7 @@ impl State {
             tx.scroll_into_view_in("palette-list", format!("palette-{}", a.id()));
         }
         if picking {
-            self.preview_axis();
+            self.preview_pick();
         }
         true
     }
@@ -1999,31 +2282,111 @@ mod tests {
 
     #[test]
     fn the_weight_list_spans_the_axis_and_takes_a_typed_number() {
-        let w = AxisPick { axis: Axis::Weight, style: 0, family: "X".into(), range: Some((200.0, 400.0, 800.0)), current: 450.0, previewed: false };
-        let rows = State::axis_items(&w, "");
-        let ws: Vec<u32> = rows.iter().map(|r| match r.0 { Action::SetAxis(Axis::Weight, 0, n) => n / 10, _ => panic!() }).collect();
+        let w = Pick { setting: Setting::Weight, family: "X".into(), range: Some((200.0, 400.0, 800.0)), current: 450.0, previewed: false };
+        let rows = State::pick_items(&w, "");
+        let ws: Vec<u32> = rows.iter().map(|r| match r.0 { Action::Set(Setting::Weight, n) => n / 10, _ => panic!() }).collect();
         assert_eq!(ws, [200, 300, 400, 450, 500, 600, 700, 800]);
         assert_eq!(rows[3].2, "in use");
         assert_eq!(rows[2].2, "font default");
         assert_eq!(rows[1].1, "Light · 300");
-        assert_eq!(State::axis_items(&w, "35"), vec![]);
-        let typed: Vec<_> = State::axis_items(&w, "350").into_iter().map(|r| r.0).collect();
-        assert_eq!(typed, [Action::SetAxis(Axis::Weight, 0, 3500)]);
-        assert_eq!(State::axis_items(&w, "900"), vec![]);
-        assert_eq!(State::axis_items(&w, "semi")[0].0, Action::SetAxis(Axis::Weight, 0, 6000));
-        let none = AxisPick { range: None, ..w };
-        assert!(State::axis_items(&none, "").is_empty());
+        assert_eq!(State::pick_items(&w, "35"), vec![]);
+        let typed: Vec<_> = State::pick_items(&w, "350").into_iter().map(|r| r.0).collect();
+        assert_eq!(typed, [Action::Set(Setting::Weight, 3500)]);
+        assert_eq!(State::pick_items(&w, "900"), vec![]);
+        assert_eq!(State::pick_items(&w, "semi")[0].0, Action::Set(Setting::Weight, 6000));
+        let none = Pick { range: None, ..w };
+        assert!(State::pick_items(&none, "").is_empty());
     }
 
     #[test]
     fn the_width_list_names_condensed_to_expanded() {
         // Martian Mono's width axis.
-        let w = AxisPick { axis: Axis::Width, style: 0, family: "X".into(), range: Some((75.0, 112.5, 112.5)), current: 100.0, previewed: false };
-        let titles: Vec<String> = State::axis_items(&w, "").into_iter().map(|r| r.1).collect();
+        let w = Pick { setting: Setting::Width, family: "X".into(), range: Some((75.0, 112.5, 112.5)), current: 100.0, previewed: false };
+        let titles: Vec<String> = State::pick_items(&w, "").into_iter().map(|r| r.1).collect();
         assert_eq!(titles, ["Condensed · 75", "SemiCondensed · 87.5", "Normal · 100", "SemiExpanded · 112.5"]);
-        assert_eq!(State::axis_items(&w, "")[2].2, "in use");
-        assert_eq!(State::axis_items(&w, "semic")[0].0, Action::SetAxis(Axis::Width, 0, 875));
-        assert_eq!(State::axis_items(&w, "90")[0].1, "Width · 90");
+        assert_eq!(State::pick_items(&w, "")[2].2, "in use");
+        assert_eq!(State::pick_items(&w, "semic")[0].0, Action::Set(Setting::Width, 875));
+        assert_eq!(State::pick_items(&w, "90")[0].1, "Width · 90");
+    }
+
+    #[test]
+    fn size_line_height_fit_and_cursor_lists() {
+        let pick = |setting, range, current| Pick { setting, family: "X".into(), range: Some(range), current, previewed: false };
+        // Font size: the usual sizes and the config's, which is in use; 13 is the default.
+        let size = pick(Setting::FontSize, (4.0, 13.0, 96.0), 23.0);
+        let rows = State::pick_items(&size, "");
+        assert!(rows.iter().any(|r| r.1 == "23 pt" && r.2 == "in use"));
+        assert!(rows.iter().any(|r| r.1 == "13 pt" && r.2 == "default"));
+        assert_eq!(State::pick_items(&size, "19.5")[0].0, Action::Set(Setting::FontSize, 195));
+        // Line height in the config's unit, or in the one typed.
+        let px = pick(Setting::LinePixels, (0.0, 0.0, 100.0), 32.0);
+        assert!(State::pick_items(&px, "").iter().any(|r| r.1 == "32 px" && r.2 == "in use"));
+        let typed: Vec<_> = State::pick_items(&px, "20%").into_iter().map(|r| r.0).collect();
+        assert!(typed.contains(&Action::Set(Setting::LinePercent, 200)), "{typed:?}");
+        // Fit: off, then up to 15%.
+        let fit = pick(Setting::Fit, (0.0, 0.0, 15.0), 5.0);
+        let rows = State::pick_items(&fit, "");
+        assert_eq!(rows[0].1, "Off: the exact size");
+        assert_eq!(rows.last().unwrap().1, "Up to 15%");
+        assert!(rows.iter().any(|r| r.1 == "Up to 5%" && r.2 == "in use"));
+        // Cursor styles by name; numbers aren't values there.
+        let cursor = pick(Setting::CursorStyle, (0.0, 0.0, 3.0), 0.0);
+        let names: Vec<String> = State::pick_items(&cursor, "").into_iter().map(|r| r.1).collect();
+        assert_eq!(names, ["Bar", "Block", "Underline", "Hollow block"]);
+        assert_eq!(State::pick_items(&cursor, "holl")[0].0, Action::Set(Setting::CursorStyle, 30));
+    }
+
+    #[test]
+    fn a_setting_applies_as_it_would_be_saved() {
+        let mut c = Config::default();
+        apply_setting(&mut c, Setting::LinePixels, 4.0);
+        assert_eq!((c.font.cell_height, c.font.cell_height_px), (0.0, 4.0));
+        apply_setting(&mut c, Setting::LinePercent, 30.0);
+        assert_eq!((c.font.cell_height, c.font.cell_height_px), (0.3, 0.0));
+        apply_setting(&mut c, Setting::Fit, 5.0);
+        assert_eq!(c.font.fit, 0.05);
+        apply_setting(&mut c, Setting::Width, 87.5);
+        apply_setting(&mut c, Setting::Weight, 200.0);
+        assert_eq!(c.font.variations[0], vec![("wdth".to_string(), 87.5), ("wght".to_string(), 200.0)]);
+        apply_setting(&mut c, Setting::CursorStyle, 3.0);
+        assert_eq!(c.cursor_style, vt::CursorStyle::BlockHollow);
+    }
+
+    #[test]
+    fn a_split_moves_to_another_tab_or_a_new_one() {
+        let mut s = state_with(2);
+        let ids = s.tabs[0].root.leaves();
+        s.new_tab(None);
+        let other = s.tabs[1].root.first();
+        s.select_tab(0);
+        // To tab 2: beside its split, and focused there.
+        s.move_to_tab(ids[1], Some(1));
+        assert_eq!(s.tabs[0].root.leaves(), vec![ids[0]]);
+        assert_eq!(s.tabs[1].root.leaves(), vec![other, ids[1]]);
+        assert_eq!((s.active, s.tabs[1].focused), (1, ids[1]));
+        // To a new tab.
+        s.move_to_tab(ids[1], None);
+        assert_eq!(s.tabs.len(), 3);
+        assert_eq!(s.tabs[2].root.leaves(), vec![ids[1]]);
+        assert_eq!(s.active, 2);
+        // A tab's only split doesn't move to a new tab, nor to its own.
+        s.move_to_tab(ids[1], None);
+        s.move_to_tab(ids[1], Some(2));
+        assert_eq!(s.tabs.len(), 3);
+        // Moving a tab's last split away closes that tab.
+        s.move_to_tab(ids[1], Some(0));
+        assert_eq!(s.tabs.len(), 2);
+        assert_eq!(s.tabs[0].root.leaves(), vec![ids[0], ids[1]]);
+        assert_eq!(s.active, 0);
+        // A floating split floats in its new tab.
+        s.toggle_float(ids[1]);
+        s.move_to_tab(ids[1], Some(1));
+        assert!(s.tabs[1].is_floating(ids[1]));
+        assert!(!s.tabs[0].has(ids[1]));
+        // A tab number past the last is a new tab.
+        s.move_to_tab(ids[1], Some(8));
+        assert_eq!(s.tabs.len(), 3);
+        assert_eq!(s.tabs[2].root.leaves(), vec![ids[1]]);
     }
 
     #[test]

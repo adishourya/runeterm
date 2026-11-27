@@ -38,14 +38,23 @@ pub enum Action {
     ToggleSidebar,
     ToggleTheme,
     ToggleSmoothCursor,
-    /// Pick the weight of a variable font's regular (or bold) text, from the palette.
-    FontWeight,
-    BoldFontWeight,
-    /// Pick the width all styles share, from the palette.
-    FontWidth,
-    /// A row of those lists: the axis, the style (0 regular, 1 bold) and the value in tenths.
-    /// Not in the config or the main palette.
-    SetAxis(Axis, u8, u32),
+    /// Move the focused split to tab 1 to 9 (a new tab past the last one), or to a new tab.
+    MoveToTab(u8),
+    MoveToNewTab,
+    /// Open one of the palette's lists of a setting's values (font weight, size…).
+    Pick(Setting),
+    /// A row of those lists: the setting and its value, in tenths for a number (87.5 is 875)
+    /// or the choice's index. Not in the config or the main palette.
+    Set(Setting, u32),
+    /// The font size for now, not saved (Ghostty's ctrl+= and ctrl+-), and back to the config's.
+    FontBigger,
+    FontSmaller,
+    FontReset,
+    ToggleCopyOnSelect,
+    ToggleConfirmClose,
+    ToggleNotifications,
+    /// Open the config in the editor beside the split; it reloads when the editor closes.
+    EditConfig,
     EditScrollback,
     ReloadConfig,
     Copy,
@@ -53,18 +62,48 @@ pub enum Action {
     CommandPalette,
 }
 
-/// A variable font axis the palette picks.
+/// A setting the palette lists the values of, to try each and keep one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Axis {
+pub enum Setting {
+    /// Regular text's weight (`font-variation`'s wght).
     Weight,
+    /// Bold text's (`font-variation-bold`'s wght).
+    BoldWeight,
+    /// The width every style shares (`font-variation`'s wdth).
     Width,
+    FontSize,
+    /// `line-height` as a percent of the font's own…
+    LinePercent,
+    /// …or in pixels.
+    LinePixels,
+    /// `font-size-fit`, in percent.
+    Fit,
+    Padding,
+    CursorStyle,
 }
 
-impl Axis {
-    pub fn tag(self) -> &'static str {
+impl Setting {
+    /// Its variable font axis, for the ones that are one.
+    pub fn axis(self) -> Option<&'static str> {
         match self {
-            Axis::Weight => "wght",
-            Axis::Width => "wdth",
+            Setting::Weight | Setting::BoldWeight => Some("wght"),
+            Setting::Width => Some("wdth"),
+            _ => None,
+        }
+    }
+
+    /// A short name for keys and ids.
+    pub fn name(self) -> &'static str {
+        match self {
+            Setting::Weight => "weight",
+            Setting::BoldWeight => "bold-weight",
+            Setting::Width => "width",
+            Setting::FontSize => "font-size",
+            Setting::LinePercent => "line-percent",
+            Setting::LinePixels => "line-pixels",
+            Setting::Fit => "fit",
+            Setting::Padding => "padding",
+            Setting::CursorStyle => "cursor-style",
         }
     }
 }
@@ -104,15 +143,37 @@ const TABLE: &[(Action, &str, &str)] = &[
     (Action::GotoTab(7), "goto-tab-7", "Go to tab 7"),
     (Action::GotoTab(8), "goto-tab-8", "Go to tab 8"),
     (Action::GotoTab(9), "goto-tab-9", "Go to tab 9"),
+    (Action::MoveToTab(1), "move-to-tab-1", "Move split to tab 1"),
+    (Action::MoveToTab(2), "move-to-tab-2", "Move split to tab 2"),
+    (Action::MoveToTab(3), "move-to-tab-3", "Move split to tab 3"),
+    (Action::MoveToTab(4), "move-to-tab-4", "Move split to tab 4"),
+    (Action::MoveToTab(5), "move-to-tab-5", "Move split to tab 5"),
+    (Action::MoveToTab(6), "move-to-tab-6", "Move split to tab 6"),
+    (Action::MoveToTab(7), "move-to-tab-7", "Move split to tab 7"),
+    (Action::MoveToTab(8), "move-to-tab-8", "Move split to tab 8"),
+    (Action::MoveToTab(9), "move-to-tab-9", "Move split to tab 9"),
+    (Action::MoveToNewTab, "move-to-new-tab", "Move split to a new tab"),
     (Action::Sessions, "sessions", "Sessions"),
     (Action::NewSession, "new-session", "New session"),
     (Action::RenameSession, "rename-session", "Rename session"),
     (Action::ToggleSidebar, "toggle-sidebar", "Pin or unpin the sidebar"),
     (Action::ToggleTheme, "toggle-theme", "Light or dark mode"),
     (Action::ToggleSmoothCursor, "toggle-smooth-cursor", "Smooth cursor on or off"),
-    (Action::FontWeight, "font-weight", "Font weight…"),
-    (Action::BoldFontWeight, "bold-font-weight", "Bold font weight…"),
-    (Action::FontWidth, "font-width", "Font width (condensed, expanded)…"),
+    (Action::Pick(Setting::FontSize), "font-size", "Font size…"),
+    (Action::FontBigger, "increase-font-size", "Bigger text (for now)"),
+    (Action::FontSmaller, "decrease-font-size", "Smaller text (for now)"),
+    (Action::FontReset, "reset-font-size", "Text back to the config's size"),
+    (Action::Pick(Setting::LinePixels), "line-height", "Line height…"),
+    (Action::Pick(Setting::Fit), "font-size-fit", "Font size fit (relax the size to fill splits)…"),
+    (Action::Pick(Setting::Weight), "font-weight", "Font weight…"),
+    (Action::Pick(Setting::BoldWeight), "bold-font-weight", "Bold font weight…"),
+    (Action::Pick(Setting::Width), "font-width", "Font width (condensed, expanded)…"),
+    (Action::Pick(Setting::Padding), "padding", "Padding around the text…"),
+    (Action::Pick(Setting::CursorStyle), "cursor-style", "Cursor style…"),
+    (Action::ToggleCopyOnSelect, "toggle-copy-on-select", "Copy on select on or off"),
+    (Action::ToggleConfirmClose, "toggle-confirm-close", "Confirm closing busy splits on or off"),
+    (Action::ToggleNotifications, "toggle-notifications", "Desktop notifications on or off"),
+    (Action::EditConfig, "edit-config", "Edit config"),
     (Action::EditScrollback, "edit-scrollback", "Open scrollback in editor"),
     (Action::ReloadConfig, "reload-config", "Reload config"),
     (Action::Copy, "copy", "Copy selection"),
@@ -144,6 +205,20 @@ const DEFAULTS: &[(&str, Action)] = &[
     ("alt+s", Action::ResizeDown),
     ("alt+d", Action::ResizeRight),
     ("alt+t", Action::NewTab),
+    ("alt+shift+1", Action::MoveToTab(1)),
+    ("alt+shift+2", Action::MoveToTab(2)),
+    ("alt+shift+3", Action::MoveToTab(3)),
+    ("alt+shift+4", Action::MoveToTab(4)),
+    ("alt+shift+5", Action::MoveToTab(5)),
+    ("alt+shift+6", Action::MoveToTab(6)),
+    ("alt+shift+7", Action::MoveToTab(7)),
+    ("alt+shift+8", Action::MoveToTab(8)),
+    ("alt+shift+9", Action::MoveToTab(9)),
+    ("alt+shift+0", Action::MoveToNewTab),
+    ("ctrl+=", Action::FontBigger),
+    ("ctrl+plus", Action::FontBigger),
+    ("ctrl+-", Action::FontSmaller),
+    ("ctrl+0", Action::FontReset),
     ("alt+1", Action::GotoTab(1)),
     ("alt+2", Action::GotoTab(2)),
     ("alt+3", Action::GotoTab(3)),
@@ -177,7 +252,7 @@ impl Action {
     /// A key for the palette's row: the action's name, or its weight for a weight row.
     pub fn id(self) -> String {
         match self {
-            Action::SetAxis(axis, style, v) => format!("{}-{style}-{v}", axis.tag()),
+            Action::Set(setting, v) => format!("{}-{v}", setting.name()),
             a => a.name().to_string(),
         }
     }

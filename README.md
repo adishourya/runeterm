@@ -15,7 +15,14 @@ outlive the window and come back after a reboot.
 - **Splits as surfaces.** Every split is a rounded, shadowed Rune surface, with the grid drawn
   into it by its own wgpu pipeline. Splits can be zoomed, minimized to a pill, or floated above
   the others, and a floating split can be pinned so it stays in view on every tab.
-- **A command palette.** Alt+P lists every action with its key; type to filter.
+- **A command palette.** Alt+P lists every action with its key; type to filter. Settings
+  are there too: font size, line height, how far the size may relax to fill a split, font
+  weight and width, padding and cursor style each open a list whose values show in the
+  terminals as you arrow through them (Enter saves to the config, Esc puts it back), and
+  copy on select, confirm close and notifications switch on and off. "Edit config" opens
+  the config beside the split and reloads it when the editor closes.
+- **Splits move between tabs.** Alt+Shift+2 sends the split to tab 2 (beside its split,
+  floating if it floated); Alt+Shift+0 gives it a tab of its own.
 - **Ghostty's config.** The config uses Ghostty's syntax (`keybind` lines too), and the first
   run writes it from Ghostty's: font, colours, cursor and custom shaders, cursor shaders too.
 - **Real text rendering.** Text is shaped, so ligatures show as in Ghostty, with
@@ -103,6 +110,8 @@ Without a daemon, runeterm runs plain local shells (`RUNETERM_LOCAL=1` forces th
 | Alt+Shift+F | Pin a floating split across tabs |
 | Alt+X | Close the split |
 | Alt+T, Alt+1 to 9 | New tab, go to a tab |
+| Alt+Shift+1 to 9 / Alt+Shift+0 | Move the split to that tab / to a new tab |
+| Ctrl+= / Ctrl+- / Ctrl+0 | Bigger / smaller text for now, back to the config's size |
 | Alt+/ | Pin or unpin the sidebar |
 | Alt+E | Open the scrollback in an editor (`scrollback-editor`) |
 | Alt+R | Reload the config |
