@@ -55,6 +55,13 @@ impl Node {
         out
     }
 
+    /// Every leaf with its rect in the unit square, in layout order.
+    pub fn layout(&self) -> Vec<(u32, Rect)> {
+        let mut out = vec![];
+        self.rects([0.0, 0.0, 1.0, 1.0], &mut |id, r| out.push((id, r)));
+        out
+    }
+
     /// Replaces leaf `at` with a split holding it and `new` (after it, in `dir`).
     pub fn split(&mut self, at: u32, new: u32, dir: Dir) {
         match self {

@@ -239,6 +239,11 @@ fn save_setting(setting: Setting, v: f32) -> std::io::Result<()> {
     }
 }
 
+/// How many tabs the exposé puts side by side: a square-ish grid.
+pub fn expose_cols(tabs: usize) -> usize {
+    ((tabs.max(1) as f32).sqrt().ceil() as usize).max(1)
+}
+
 /// What the session picker shows.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PickerMode {
@@ -299,6 +304,8 @@ pub struct State {
     /// Panes a desktop notification went out for, until they're seen.
     notified: std::collections::HashSet<u32>,
     pub settings: Behaviour,
+    /// The exposé (⌥Tab), while it's open: the split chosen in it.
+    pub expose: Option<u32>,
     /// Points added to the config's font size for now (ctrl+= and ctrl+-), not saved.
     pub font_delta: f32,
     /// The split editing the config (Edit config): the config reloads when it closes.
@@ -424,6 +431,7 @@ impl State {
             settings: Behaviour::from(config),
             font_delta: 0.0,
             config_editor: None,
+            expose: None,
             light: config.light,
             accent: config.accent,
             default_accent: config.accent,
@@ -1347,6 +1355,7 @@ impl State {
             Action::ToggleSidebar => self.toggle_sidebar(),
             Action::ToggleTheme => self.set_light(!self.light),
             Action::ToggleSmoothCursor => self.set_smooth_cursor(!Config::load().cursor_smooth),
+            Action::Expose => self.open_expose(tx),
             Action::Pick(setting) => self.open_pick(setting, tx),
             Action::Set(setting, v) => self.set_setting(setting, v),
             Action::FontBigger => self.nudge_font(1.0),
@@ -1488,6 +1497,134 @@ impl State {
             }
             Err(e) => eprintln!("runeterm: can't start {}: {e}", self.scrollback_editor),
         }
+    }
+
+    /// Opens the exposé on the focused split, or (open already, as ⌥Tab is pressed again while
+    /// ⌥ is held in an app switcher) chooses the next split. It swaps in at once: the splits
+    /// are drawn small there, and a frame of both sizes would remake every glyph twice.
+    pub fn open_expose(&mut self, tx: &mut Tx) {
+        match self.expose {
+            Some(_) => self.expose_step(1),
+            None => {
+                self.palette = None;
+                self.expose = self.focused_id().or_else(|| self.expose_order().first().copied());
+                tx.instant();
+            }
+        }
+    }
+
+    /// Every split the exposé shows, tab by tab: each tab's layout, then its floating and
+    /// minimized ones.
+    pub fn expose_order(&self) -> Vec<u32> {
+        self.tabs.iter().flat_map(|t| t.panes()).collect()
+    }
+
+    /// Chooses the split `by` along in the exposé, wrapping around.
+    pub fn expose_step(&mut self, by: isize) {
+        let order = self.expose_order();
+        if order.is_empty() {
+            return;
+        }
+        let at = self.expose.and_then(|id| order.iter().position(|&o| o == id)).unwrap_or(0) as isize;
+        self.expose = Some(order[(at + by).rem_euclid(order.len() as isize) as usize]);
+    }
+
+    /// Where each split sits in the exposé, in tab widths: the tabs in the view's grid (see
+    /// `expose_cols`), each split where it is in its tab, floating ones where they float, and
+    /// minimized ones in a row along the tab's label.
+    pub fn expose_rects(&self) -> Vec<(u32, [f32; 4])> {
+        let [w, h] = self.stage;
+        let aspect = if w > 0.0 && h > 0.0 { h / w } else { 0.6 };
+        let (gap, label) = (0.1, 0.08);
+        let cols = expose_cols(self.tabs.len());
+        let mut out = vec![];
+        for (i, tab) in self.tabs.iter().enumerate() {
+            let (c, r) = ((i % cols) as f32, (i / cols) as f32);
+            let (x0, y0) = (c * (1.0 + gap), r * (aspect + gap + label) + label);
+            let at = |q: [f32; 4]| [x0 + q[0], y0 + q[1] * aspect, q[2], q[3] * aspect];
+            out.extend(tab.root.layout().into_iter().map(|(id, q)| (id, at(q))));
+            out.extend(tab.floating.iter().map(|f| (f.id, at(f.rect))));
+            for (j, m) in tab.minimized.iter().enumerate() {
+                out.push((m.id, [x0 + 0.3 + 0.1 * j as f32, y0 - label, 0.08, label * 0.8]));
+            }
+        }
+        out
+    }
+
+    /// Chooses the split next to the chosen one on `side` in the exposé, across tabs too: of
+    /// the ones past its edge that way, those level with it (overlapping across the move)
+    /// first, then the nearest.
+    pub fn expose_dir(&mut self, side: Side) {
+        let Some(id) = self.expose else { return };
+        let rects = self.expose_rects();
+        let Some(&(_, me)) = rects.iter().find(|(i, _)| *i == id) else { return };
+        let centre = |r: [f32; 4]| (r[0] + r[2] / 2.0, r[1] + r[3] / 2.0);
+        let (mx, my) = centre(me);
+        let overlap = |a0: f32, a1: f32, b0: f32, b1: f32| a1.min(b1) - a0.max(b0) > 1e-4;
+        let best = rects.iter()
+            .filter(|(i, _)| *i != id)
+            .filter_map(|&(i, r)| {
+                let (x, y) = centre(r);
+                let (along, across, level) = match side {
+                    Side::Right => (x - mx, (y - my).abs(), overlap(me[1], me[1] + me[3], r[1], r[1] + r[3])),
+                    Side::Left => (mx - x, (y - my).abs(), overlap(me[1], me[1] + me[3], r[1], r[1] + r[3])),
+                    Side::Down => (y - my, (x - mx).abs(), overlap(me[0], me[0] + me[2], r[0], r[0] + r[2])),
+                    Side::Up => (my - y, (x - mx).abs(), overlap(me[0], me[0] + me[2], r[0], r[0] + r[2])),
+                };
+                // Past my edge on that side; or, for splits drawn over one another (a floating
+                // one over the layout), its centre past mine.
+                let eps = 1e-3;
+                let past = match side {
+                    Side::Right => r[0] >= me[0] + me[2] - eps,
+                    Side::Left => r[0] + r[2] <= me[0] + eps,
+                    Side::Down => r[1] >= me[1] + me[3] - eps,
+                    Side::Up => r[1] + r[3] <= me[1] + eps,
+                };
+                let over = overlap(me[0], me[0] + me[2], r[0], r[0] + r[2]) && overlap(me[1], me[1] + me[3], r[1], r[1] + r[3]);
+                ((past || over) && along > 1e-4).then_some((i, !level, along + 2.0 * across))
+            })
+            .min_by(|a, b| a.1.cmp(&b.1).then(a.2.total_cmp(&b.2)));
+        if let Some((i, ..)) = best {
+            self.expose = Some(i);
+        }
+    }
+
+    /// Closes the exposé, going to split `id` (its tab, focused) when given.
+    pub fn close_expose(&mut self, id: Option<u32>, tx: &mut Tx) {
+        self.expose = None;
+        if let Some(id) = id {
+            self.focus(id);
+        }
+        tx.instant();
+    }
+
+    /// A key while the exposé is open: arrows (or hjkl) move to the split that way, Tab steps
+    /// through them in order, Enter goes, Escape closes. It takes every key.
+    fn expose_key(&mut self, e: &KeyEvent, tx: &mut Tx) -> bool {
+        // Its key again steps on, as in an app switcher; ⌥⇧Tab steps back.
+        if self.keybinds.is(Action::Expose, e, tx) || (e.key == Key::Tab && e.mods.alt) {
+            self.expose_step(if e.mods.shift { -1 } else { 1 });
+            return true;
+        }
+        let ch = match &e.key {
+            Key::Text(t) => t.chars().next(),
+            _ => None,
+        };
+        match (&e.key, ch) {
+            (Key::Escape, _) => self.close_expose(None, tx),
+            (Key::Enter, _) | (_, Some(' ')) => {
+                let id = self.expose;
+                self.close_expose(id, tx);
+            }
+            (Key::Tab, _) if e.mods.shift => self.expose_step(-1),
+            (Key::Tab, _) => self.expose_step(1),
+            (Key::Right, _) | (_, Some('l')) => self.expose_dir(Side::Right),
+            (Key::Left, _) | (_, Some('h')) => self.expose_dir(Side::Left),
+            (Key::Down, _) | (_, Some('j')) => self.expose_dir(Side::Down),
+            (Key::Up, _) | (_, Some('k')) => self.expose_dir(Side::Up),
+            _ => {}
+        }
+        true
     }
 
     /// Moves split `id` to tab `to` (0-based; past the last tab, or None, a new one), beside
@@ -1761,6 +1898,9 @@ impl State {
                 }
                 _ => {}
             }
+        }
+        if self.expose.is_some() {
+            return self.expose_key(e, tx);
         }
         // The palette's field has focus and takes its own keys; these are the ones it passed
         // on, or all of them once it lost focus.
@@ -2350,6 +2490,25 @@ mod tests {
         assert_eq!(c.font.variations[0], vec![("wdth".to_string(), 87.5), ("wght".to_string(), 200.0)]);
         apply_setting(&mut c, Setting::CursorStyle, 3.0);
         assert_eq!(c.cursor_style, vt::CursorStyle::BlockHollow);
+    }
+
+    /// Three tabs sit two to a row in the exposé: ↓ goes down a row, → along one.
+    #[test]
+    fn expose_arrows_cross_rows_of_tabs() {
+        let mut s = state_with(1);
+        s.new_tab(None);
+        s.new_tab(None);
+        s.stage = [1000.0, 600.0];
+        let [t0, t1, t2] = [0, 1, 2].map(|i| s.tabs[i].root.first());
+        s.expose = Some(t0);
+        s.expose_dir(Side::Right);
+        assert_eq!(s.expose, Some(t1));
+        s.expose_dir(Side::Down);
+        assert_eq!(s.expose, Some(t2), "below the row, though not under tab 2");
+        s.expose_dir(Side::Up);
+        assert_eq!(s.expose, Some(t0), "back up: the one level with it");
+        s.expose_dir(Side::Left);
+        assert_eq!(s.expose, Some(t0), "nothing left of the first");
     }
 
     #[test]

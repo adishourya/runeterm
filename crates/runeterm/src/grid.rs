@@ -703,6 +703,9 @@ struct Row {
 struct Site {
     rect: [f32; 4],
     scale: f32,
+    /// Drawn `k` times its size in the exposé (`effect_data` [1, k, …]): the pane keeps its
+    /// grid, so its program isn't resized for a thumbnail, and its cells are `k` times theirs.
+    preview: Option<f32>,
 }
 
 /// A pane's offscreen targets for its shader chain: the grid goes into `tex[0]`, and each
@@ -1184,7 +1187,8 @@ impl GridRenderer {
     fn column_height(&self, s: &State) -> Option<(f32, f32)> {
         let tab = s.tab()?;
         let slot = |id: u32| {
-            let site = self.panes.get(&id).filter(|_| self.last_seen.contains(&id))?.site?;
+            // Thumbnails in the exposé say nothing about the splits' own heights.
+            let site = self.panes.get(&id).filter(|_| self.last_seen.contains(&id))?.site.filter(|s| s.preview.is_none())?;
             Some((site.rect[3] - 2.0 * (self.spec.padding * site.scale).round(), site.scale))
         };
         fn walk(n: &crate::split::Node, slot: &dyn Fn(u32) -> Option<(f32, f32)>) -> Option<(f32, f32)> {
@@ -1451,6 +1455,24 @@ impl GridRenderer {
 
     fn metrics_at(&mut self, scale: f32) -> Metrics {
         let (px, h) = self.cell_size(scale);
+        self.metrics_px(px, h)
+    }
+
+    /// Cell metrics for a site: its scale's, or for an exposé thumbnail drawn `k` times its
+    /// size, `k` times the cells the window's scale has.
+    fn metrics_for(&mut self, site: Site) -> Metrics {
+        match site.preview {
+            Some(k) => {
+                let (px, h) = self.cell_size(site.scale / k);
+                self.metrics_px((px * k).max(1.0), (h * k).max(1.0))
+            }
+            None => self.metrics_at(site.scale),
+        }
+    }
+
+    /// Metrics for font size `px` and cell height `h` (device pixels), made once per size: a
+    /// new size is new glyphs, and every pane redraws in full.
+    fn metrics_px(&mut self, px: f32, h: f32) -> Metrics {
         match self.metrics {
             Some(m) if (m.px - px).abs() < 0.5 && (m.h - h).abs() < 0.5 => m,
             _ => {
@@ -1471,7 +1493,7 @@ impl GridRenderer {
     /// is gone.
     fn prepare(&mut self, s: &State, id: u32, site: Site, device: &wgpu::Device, queue: &wgpu::Queue, dt: f32) -> bool {
         let Some(pane) = s.panes.get(&id) else { return false };
-        let m = self.metrics_at(site.scale);
+        let m = self.metrics_for(site);
         let rect = site.rect;
         let pad = (self.spec.padding * site.scale).round();
         let want = (
@@ -1482,8 +1504,14 @@ impl GridRenderer {
         let gpu = self.gpu.as_ref().unwrap();
         let p = self.panes.entry(id).or_insert_with(|| gpu.pane(device));
         p.site = Some(site);
+        // A thumbnail keeps the grid the pane has: its program isn't resized for it.
+        if site.preview.is_some() {
+            p.grid = p.grid.or_else(|| Some(pane.term.lock().unwrap().size()));
+            p.pending_grid = None;
+        }
         // Resize the terminal once the layout settles, not on every frame of a spring.
         match (p.grid, p.pending_grid) {
+            _ if site.preview.is_some() => {}
             (None, _) => {
                 pane.resize(want.0, want.1, m.w as u32, m.h as u32);
                 p.grid = Some(want);
@@ -1498,7 +1526,7 @@ impl GridRenderer {
             _ => p.pending_grid = Some((want, self.time)),
         }
 
-        if let Some((cols, rows)) = p.grid {
+        if let Some((cols, rows)) = p.grid.filter(|_| site.preview.is_none()) {
             let g = Geometry { scale: site.scale, pad, cell_w: m.w, cell_h: m.h, cols, rows, width: rect[2], height: rect[3] };
             GEOMETRY.lock().unwrap().get_or_insert_with(HashMap::new).insert(id, g);
         }
@@ -1864,10 +1892,11 @@ impl Compositor<State> for GridRenderer {
         f.ui.draw_with(f.encoder, f.target, clear, &mut |pass, site: &EffectSite<'_>| {
             let id = site.mark;
             let r = site.instance.rect;
-            let here = Site { rect: r, scale: site.scale };
+            let preview = (site.data[0] == 1.0).then_some(site.data[1]).filter(|k| *k > 0.0);
+            let here = Site { rect: r, scale: site.scale, preview };
             // A pane new this frame is drawn directly; from the next frame on it goes through
             // its shaders.
-            let moved = self.panes.get(&id).and_then(|p| p.site).is_none_or(|s| s.rect != r || s.scale != site.scale);
+            let moved = self.panes.get(&id).and_then(|p| p.site).is_none_or(|s| s.rect != r || s.scale != site.scale || s.preview != preview);
             let ready = self.panes.get(&id).is_some_and(|p| p.prepared);
             if !ready {
                 if !self.prepare(state, id, here, device, queue, dt) {

@@ -21,6 +21,11 @@ outlive the window and come back after a reboot.
   terminals as you arrow through them (Enter saves to the config, Esc puts it back), and
   copy on select, confirm close and notifications switch on and off. "Edit config" opens
   the config beside the split and reloads it when the editor closes.
+- **Exposé.** Alt+Tab shows every tab side by side as a live miniature of its layout.
+  Click a split, or move to one with the arrows (or hjkl, to the split that way on screen,
+  across tabs too; Alt+Tab steps through them in order) and Enter, to go to its tab with it
+  focused. The splits keep their size: a thumbnail is the
+  split drawn smaller, so nothing running in it is resized.
 - **Splits move between tabs.** Alt+Shift+2 sends the split to tab 2 (beside its split,
   floating if it floated); Alt+Shift+0 gives it a tab of its own.
 - **Ghostty's config.** The config uses Ghostty's syntax (`keybind` lines too), and the first
@@ -110,6 +115,7 @@ Without a daemon, runeterm runs plain local shells (`RUNETERM_LOCAL=1` forces th
 | Alt+Shift+F | Pin a floating split across tabs |
 | Alt+X | Close the split |
 | Alt+T, Alt+1 to 9 | New tab, go to a tab |
+| Alt+Tab | Exposé: every split of every tab; click one (or arrows and Enter) to go there |
 | Alt+Shift+1 to 9 / Alt+Shift+0 | Move the split to that tab / to a new tab |
 | Ctrl+= / Ctrl+- / Ctrl+0 | Bigger / smaller text for now, back to the config's size |
 | Alt+/ | Pin or unpin the sidebar |

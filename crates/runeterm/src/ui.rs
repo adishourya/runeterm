@@ -1029,6 +1029,9 @@ pub fn view(s: &State, _: &mut Cx<State>) -> El {
     if let Some(tab) = s.tab().filter(|t| t.floating.iter().any(|f| !f.pinned) && !t.zoomed) {
         layer = layer.child(floats(s, tab, false));
     }
+    // The exposé takes the stage's place: every split is drawn there, small.
+    let showing = s.expose.is_none();
+    let layer = if showing { layer } else { expose(s) };
     let mut stage = el().key("stage").grow(1.0).h_full().min_w(0.0)
         .clip_rounded(look::RADIUS)
         // Floating splits are placed as fractions of it.
@@ -1040,10 +1043,10 @@ pub fn view(s: &State, _: &mut Cx<State>) -> El {
         .child_exit(slide(-dir))
         .child(layer);
     // Pinned floating splits sit above the tabs, still while they slide.
-    if let Some(tab) = s.tab().filter(|t| t.floating.iter().any(|f| f.pinned) && !t.zoomed) {
+    if let Some(tab) = s.tab().filter(|t| showing && t.floating.iter().any(|f| f.pinned) && !t.zoomed) {
         stage = stage.child(floats(s, tab, true));
     }
-    if let Some(tab) = s.tab().filter(|t| !t.minimized.is_empty()) {
+    if let Some(tab) = s.tab().filter(|t| showing && !t.minimized.is_empty()) {
         let mut dock = row().key("dock").gap(10.0).justify_center();
         for m in &tab.minimized {
             dock = dock.child(pill(s, m));
@@ -1061,6 +1064,115 @@ pub fn view(s: &State, _: &mut Cx<State>) -> El {
         root = root.child(palette(s));
     }
     root
+}
+
+/// The exposé (⌥Tab): every tab as a miniature of its layout, side by side, each split in
+/// it live and clickable. Clicking one (or choosing it with the arrows and Enter) goes to its
+/// tab and focuses it. The miniatures are the tabs laid out at the stage's own size and drawn
+/// `k` times smaller, so each split keeps its grid; its cells are drawn `k` times smaller.
+fn expose(s: &State) -> El {
+    let [w, h] = s.stage;
+    let (w, h) = (w.max(1.0), h.max(1.0));
+    let n = s.tabs.len().max(1);
+    let cols = crate::state::expose_cols(n);
+    let rows = n.div_ceil(cols);
+    let (pad, gap, label) = (32.0, 28.0, 34.0);
+    let fit_w = (w - 2.0 * pad - gap * (cols - 1) as f32) / (cols as f32 * w);
+    let fit_h = (h - 2.0 * pad - 30.0 - (gap + label) * rows as f32) / (rows as f32 * h);
+    let k = fit_w.min(fit_h).clamp(0.08, 0.62);
+    let mut grid = col().gap(gap).items_center();
+    for (r, chunk) in s.tabs.chunks(cols).enumerate() {
+        let mut line = row().gap(gap).items_start();
+        for (c, tab) in chunk.iter().enumerate() {
+            line = line.child(expose_tab(s, r * cols + c, tab, w, h, k));
+        }
+        grid = grid.child(line);
+    }
+    let hint = text("Click a split, or ←→ ↑↓ and Enter · Esc goes back").font(SMALL).color(look::faint());
+    el().key("expose").pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+        .fill(look::window())
+        .on_press_tx(|s: &mut State, tx: &mut Tx| s.close_expose(None, tx))
+        .child(col().w_full().h_full().pt(pad).pb(14.0).gap(14.0).items_center().justify_center()
+            .child(el().grow(1.0).min_h(0.0).w_full().center().child(grid))
+            .child(hint))
+}
+
+/// One tab in the exposé: its number and directory, its layout `k` times its size, and its
+/// minimized splits as chips.
+fn expose_tab(s: &State, i: usize, tab: &Tab, w: f32, h: f32, k: f32) -> El {
+    let active = i == s.active;
+    let cwd = s.panes.get(&tab.focused).map(|p| p.cwd.clone()).unwrap_or_default();
+    let splits = tab.panes().len();
+    let mut label = row().h(26.0).gap(8.0).items_center()
+        .child(el().h(20.0).px(7.0).radius(6.0).center()
+            .fill(if active { look::accent().alpha(0.22) } else { look::ink(0.07) })
+            .child(text(format!("{}", i + 1)).font(TextStyle::new(11.5, 650.0)).color(if active { look::text() } else { look::dim() })))
+        .child(text(cwd).font(TITLE).color(if active { look::text() } else { look::dim() }).single_line().truncate().max_w(w * k - 120.0))
+        .child(text(format!("{splits} split{}", if splits == 1 { "" } else { "s" })).font(SMALL).color(look::faint()));
+    for m in &tab.minimized {
+        let id = m.id;
+        let program = s.panes.get(&id).map_or(String::new(), |p| p.program.clone());
+        let chosen = s.expose == Some(id);
+        label = label.child(row().key(format!("x-min-{id}")).h(22.0).px(8.0).gap(5.0).items_center().radius(11.0)
+            .fill(if chosen { look::accent().alpha(0.3) } else { look::ink(0.07) }).hover(look::ink(0.12)).cursor(Cursor::Pointer)
+            .on_press_tx(move |s: &mut State, tx: &mut Tx| s.close_expose(Some(id), tx))
+            .child(logo(&program, 13.0, false))
+            .child(text(program).font(SMALL).color(look::dim())));
+    }
+    // The tab at the stage's size, drawn k times smaller from its top-left corner.
+    let mut full = el().pin(Some(0.0), Some(0.0), None, None).size(w, h).scale(k).origin(0.0, 0.0)
+        .child(expose_node(s, &tab.root, k));
+    for f in &tab.floating {
+        let [x, y, fw, fh] = f.rect;
+        full = full.child(el().absolute(x * w, y * h).size(fw * w, fh * h).raise()
+            .shadow(6.0 / k, 20.0 / k, look::shade(0.5))
+            .child(expose_pane(s, f.id, k)));
+    }
+    col().key(format!("x-tab-{}", tab.id)).gap(8.0)
+        .child(label)
+        .child(el().size(w * k, h * k).child(full))
+}
+
+/// A tab's layout in the exposé: its splits side by side and stacked as in the tab, without
+/// the dividers' handles.
+fn expose_node(s: &State, n: &Node, k: f32) -> El {
+    match n {
+        Node::Leaf(id) => expose_pane(s, *id, k),
+        Node::Split { dir, ratio, a, b } => {
+            let wrap = |e: El, g: f32| el().grow(g).min_w(0.0).min_h(0.0).w_full().h_full().child(e);
+            let c = if *dir == Dir::Right { row() } else { col() };
+            c.w_full().h_full().gap(look::GAP)
+                .child(wrap(expose_node(s, a, k), *ratio))
+                .child(wrap(expose_node(s, b, k), 1.0 - ratio))
+        }
+    }
+}
+
+/// A split in the exposé: its header and its live grid (a thumbnail: `effect_data` tells the
+/// renderer to keep its grid and draw it `k` times smaller). Clicking goes to it; the one
+/// chosen with the keys is ringed in the accent. Borders are `1 / k` thick so they stay
+/// visible once drawn small.
+fn expose_pane(s: &State, id: u32, k: f32) -> El {
+    let (program, cwd) = s.panes.get(&id).map(|p| (p.program.as_str(), p.cwd.as_str())).unwrap_or(("", ""));
+    let chosen = s.expose == Some(id);
+    let header = row().h(40.0).w_full().pl(12.0).pr(8.0).gap(9.0).items_center()
+        .child(logo(program, 20.0, false))
+        .child(text(program.to_string()).font(TITLE).color(look::text()).single_line())
+        .child(text(cwd.to_string()).font(BODY).color(look::dim()).single_line().truncate().shrink());
+    let grid = effect(id).key(format!("x-grid-{id}")).effect_data([1.0, k, 0.0, 0.0]).w_full().grow(1.0).min_h(0.0);
+    let ring = if chosen { look::accent() } else { look::hairline() };
+    col().key(format!("x-pane-{id}")).w_full().h_full().min_w(0.0).min_h(0.0)
+        .radius(look::RADIUS).fill(pane_bg(s)).clip_rounded(look::RADIUS)
+        .border(if chosen { 3.0 / k } else { 1.0 / k }, ring)
+        .hover_group()
+        .cursor(Cursor::Pointer)
+        .on_press_tx(move |s: &mut State, tx: &mut Tx| s.close_expose(Some(id), tx))
+        .child(header)
+        .child(grid)
+        // A wash of the accent on hover (and on the chosen one), over the grid too.
+        .child(el().pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0)).raise()
+            .fill(look::accent().alpha(if chosen { 0.10 } else { 0.08 }))
+            .group_opacity(if chosen { 1.0 } else { 0.0 }, 1.0))
 }
 
 /// The command palette (⌥P): every action, filtered as you type. ↑↓ choose, Enter runs, Esc
@@ -1176,6 +1288,11 @@ pub fn spec() -> AppSpec<State> {
                 s.sidebar.pinned = false;
             }),
             ("readme-float", |s| showcase(s, true)),
+            ("readme-expose", |s| {
+                // The exposé over the showcase's two tabs, its editor chosen.
+                showcase(s, false);
+                s.expose = s.focused_id();
+            }),
             ("readme-palette", |s| {
                 showcase(s, false);
                 s.palette = Some(crate::state::Palette { edit: rune::TextEdit::new("split"), chosen: 0, pick: None });
@@ -1350,6 +1467,48 @@ mod tests {
         press(&mut rt, Key::Text(")".into()), alt_shift);
         assert_eq!(rt.state.tabs.len(), 3);
         assert!(rt.state.tabs[2].has(moving), "in a new tab");
+    }
+
+    /// ⌥Tab opens the exposé on the focused split; arrows move to the split that way on
+    /// screen, across tabs too, ⌥Tab again steps on, Enter goes to the chosen split's tab and
+    /// focuses it, Escape changes nothing. No key reaches a terminal while it's open.
+    #[test]
+    fn alt_tab_opens_the_expose_and_arrows_move_on_screen() {
+        // Tab 1 is a | (b over c), tab 2 is d, side by side in the exposé.
+        let mut s = State::new(&Config::default(), false, None);
+        s.split(Dir::Right);
+        s.split(Dir::Down);
+        let [a, b, c]: [u32; 3] = s.tabs[0].root.leaves().try_into().unwrap();
+        s.new_tab(None);
+        let d = s.tabs[1].root.first();
+        s.select_tab(0);
+        s.focus(a);
+        let mut rt = Runtime::new(s, view, (1280.0, 780.0), Env::new(true, 1.0));
+        rt.on_key = Some(|s, e, tx| s.key(e, tx));
+        rt.frame(0.0);
+        press(&mut rt, Key::Tab, alt());
+        assert_eq!(rt.state.expose, Some(a), "opens on the focused split");
+        press(&mut rt, Key::Escape, Mods::default());
+        assert_eq!(rt.state.expose, None);
+        assert_eq!((rt.state.active, rt.state.tabs[0].focused), (0, a), "Escape changes nothing");
+        press(&mut rt, Key::Tab, alt());
+        let mut go = |key: Key, want: u32, why: &str| {
+            press(&mut rt, key, Mods::default());
+            assert_eq!(rt.state.expose, Some(want), "{why}");
+        };
+        go(Key::Left, a, "nothing left of a: it stays");
+        go(Key::Right, b, "right of a: the top one of b and c");
+        go(Key::Down, c, "below b");
+        go(Key::Up, b, "above c");
+        go(Key::Right, d, "right of b, into the next tab");
+        go(Key::Down, d, "nothing below d");
+        go(Key::Text("h".into()), b, "h is left: back to the level one");
+        go(Key::Text("j".into()), c, "j is down");
+        press(&mut rt, Key::Tab, alt());
+        assert_eq!(rt.state.expose, Some(d), "⌥Tab steps on in order");
+        press(&mut rt, Key::Enter, Mods::default());
+        assert_eq!(rt.state.expose, None);
+        assert_eq!((rt.state.active, rt.state.tabs[1].focused), (1, d), "went to d's tab, d focused");
     }
 
     /// ctrl+= and ctrl+- change the size for now, ctrl+0 puts it back.

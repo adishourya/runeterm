@@ -38,6 +38,8 @@ pub enum Action {
     ToggleSidebar,
     ToggleTheme,
     ToggleSmoothCursor,
+    /// Every split of every tab at once, as miniatures of the tabs; choosing one goes there.
+    Expose,
     /// Move the focused split to tab 1 to 9 (a new tab past the last one), or to a new tab.
     MoveToTab(u8),
     MoveToNewTab,
@@ -131,6 +133,7 @@ const TABLE: &[(Action, &str, &str)] = &[
     (Action::ResizeLeft, "resize-left", "Grow split left"),
     (Action::ResizeDown, "resize-down", "Grow split downward"),
     (Action::ResizeRight, "resize-right", "Grow split right"),
+    (Action::Expose, "expose", "Exposé: every split in every tab"),
     (Action::NewTab, "new-tab", "New tab"),
     (Action::NextTab, "next-tab", "Next tab"),
     (Action::PrevTab, "prev-tab", "Previous tab"),
@@ -205,6 +208,7 @@ const DEFAULTS: &[(&str, Action)] = &[
     ("alt+s", Action::ResizeDown),
     ("alt+d", Action::ResizeRight),
     ("alt+t", Action::NewTab),
+    ("alt+tab", Action::Expose),
     ("alt+shift+1", Action::MoveToTab(1)),
     ("alt+shift+2", Action::MoveToTab(2)),
     ("alt+shift+3", Action::MoveToTab(3)),
